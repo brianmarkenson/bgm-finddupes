@@ -126,19 +126,18 @@ def process_files(file_info, verbose, debug):
     processed_count = 0
     commit_count = 0
     for path, size, mtime, inode in file_info:
-        c.execute("SELECT mtime, initial_hash, crc32_hash, sha256_hash FROM files WHERE path=?", (path,))
+        c.execute("SELECT mtime, initial_hash FROM files WHERE path=?", (path,))
         result = c.fetchone()
         if debug:
             logging.debug(f"{path}: {result}")
         if not result or result[0] != mtime:
             initial_hash = hash_initial_bytes(path, size, debug)
-            crc32_hash = hash_crc32(path, debug)
-            if initial_hash and crc32_hash:
+            if initial_hash:
                 try:
-                    c.execute("REPLACE INTO files (path, size, mtime, initial_hash, crc32_hash, inode) VALUES (?, ?, ?, ?, ?, ?)",
-                              (path, size, mtime, initial_hash, crc32_hash, inode))
+                    c.execute("REPLACE INTO files (path, size, mtime, initial_hash, inode) VALUES (?, ?, ?, ?, ?)",
+                              (path, size, mtime, initial_hash, inode))
                     if debug:
-                        logging.debug(f"Inserted/Updated file {path} with initial hash {initial_hash} and CRC32 hash {crc32_hash}")
+                        logging.debug(f"Inserted/Updated file {path} with initial hash {initial_hash}")
                     commit_count += 1
                     processed_count += 1
                     if commit_count >= COMMIT_THRESHOLD:
@@ -185,28 +184,36 @@ def find_duplicates(verbose, debug):
     logging.info("Finding duplicates.")
     conn = sqlite3.connect('file_hashes.db')
     c = conn.cursor()
-    c.execute("SELECT crc32_hash, GROUP_CONCAT(path) FROM files GROUP BY crc32_hash HAVING COUNT(*) > 1")
+    c.execute("SELECT initial_hash, GROUP_CONCAT(path) FROM files GROUP BY initial_hash HAVING COUNT(*) > 1")
     potential_duplicates = c.fetchall()
 
     duplicates = []
-    for crc32_hash, paths in potential_duplicates:
+    for initial_hash, paths in potential_duplicates:
         files = paths.split(',')
         if verbose or debug:
-            print(f"Possible duplicate found with CRC32 hash {crc32_hash}: {files}")
-            logging.info(f"Possible duplicate found with CRC32 hash {crc32_hash}: {files}")
-        sha256_hash_dict = {}
+            print(f"Possible duplicate found with initial hash {initial_hash}: {files}")
+            logging.info(f"Possible duplicate found with initial hash {initial_hash}: {files}")
+        crc32_hash_dict = {}
         for file in files:
-            sha256_hash = hash_sha256(file, debug)
-            if sha256_hash in sha256_hash_dict:
-                sha256_hash_dict[sha256_hash].append(file)
+            crc32_hash = hash_crc32(file, debug)
+            if crc32_hash in crc32_hash_dict:
+                crc32_hash_dict[crc32_hash].append(file)
             else:
-                sha256_hash_dict[sha256_hash] = [file]
-        for sha256_hash_files in sha256_hash_dict.values():
-            if len(sha256_hash_files) > 1:
-                duplicates.append(sha256_hash_files)
-                if verbose or debug:
-                    print(f"Duplicate group identified with SHA-256 hash {sha256_hash}: {sha256_hash_files}")
-                    logging.info(f"Duplicate group identified with SHA-256 hash {sha256_hash}: {sha256_hash_files}")
+                crc32_hash_dict[crc32_hash] = [file]
+        for crc32_hash_files in crc32_hash_dict.values():
+            sha256_hash_dict = {}
+            for file in crc32_hash_files:
+                sha256_hash = hash_sha256(file, debug)
+                if sha256_hash in sha256_hash_dict:
+                    sha256_hash_dict[sha256_hash].append(file)
+                else:
+                    sha256_hash_dict[sha256_hash] = [file]
+            for sha256_hash_files in sha256_hash_dict.values():
+                if len(sha256_hash_files) > 1:
+                    duplicates.append(sha256_hash_files)
+                    if verbose or debug:
+                        print(f"Duplicate group identified with SHA-256 hash {sha256_hash}: {sha256_hash_files}")
+                        logging.info(f"Duplicate group identified with SHA-256 hash {sha256_hash}: {sha256_hash_files}")
 
     conn.close()
     if verbose:
