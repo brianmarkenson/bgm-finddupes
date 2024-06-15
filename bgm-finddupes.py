@@ -359,8 +359,10 @@ def generate_link_script(duplicates, verbose, debug):
     with open('link_script.sh', 'w') as f:
         for files in duplicates:
             keep = files[0]
+            keep_fs = os.stat(keep).st_dev
             for file in files[1:]:
-                if os.path.samefile(os.path.dirname(keep), os.path.dirname(file)):
+                file_fs = os.stat(file).st_dev
+                if keep_fs == file_fs:
                     f.write(f'ln -f "{keep}" "{file}"\n')
                 else:
                     f.write(f'ln -sf "{keep}" "{file}"\n')
@@ -372,7 +374,7 @@ def generate_link_script(duplicates, verbose, debug):
 def reset_processed():
     global main_conn, main_cursor
     logging.info("Resetting processed flag for all files.")
-    main_cursor.execute("UPDATE files SET processed = 0")
+    main_cursor.execute("UPDATE files SET processed = 0 WHERE processed = 1")
     main_conn.commit()
     logging.info("Processed flag reset.")
 
