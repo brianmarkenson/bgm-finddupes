@@ -8,6 +8,7 @@ import logging
 import sys
 import argparse
 import signal
+import shlex
 from PIL import Image
 import imagehash
 import magic
@@ -359,13 +360,16 @@ def generate_link_script(duplicates, verbose, debug):
     with open('link_script.sh', 'w') as f:
         for files in duplicates:
             keep = files[0]
+            print(f"{keep}")
             keep_fs = os.stat(keep).st_dev
             for file in files[1:]:
                 file_fs = os.stat(file).st_dev
+                keep_quoted = shlex.quote(keep)
+                file_quoted = shlex.quote(file)
                 if keep_fs == file_fs:
-                    f.write(f'{shlex.quote(keep)} {shlex.quote(file)}\n')
+                    f.write(f'ln -f {keep_quoted} {file_quoted}\n')
                 else:
-                    f.write(f'{shlex.quote(keep)} {shlex.quote(file)}\n')
+                    f.write(f'ln -sf {keep_quoted} {file_quoted}\n')
     if verbose:
         print(f"Linking script generated with {len(duplicates)} duplicate groups.")
     logging.info(f"Linking script generated with {len(duplicates)} duplicate groups.")
@@ -374,7 +378,7 @@ def generate_link_script(duplicates, verbose, debug):
 def reset_processed():
     global main_conn, main_cursor
     logging.info("Resetting processed flag for all files.")
-    main_cursor.execute("UPDATE files SET processed = 0 WHERE processed = 1")
+    main_cursor.execute("UPDATE files SET processed = 0")
     main_conn.commit()
     logging.info("Processed flag reset.")
 
@@ -450,3 +454,4 @@ if __name__ == "__main__":
         except Exception as e:
             logging.error(f"Unhandled exception: {e}")
             print(f"Unhandled exception: {e}")
+
