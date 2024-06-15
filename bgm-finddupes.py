@@ -8,6 +8,13 @@ import logging
 import sys
 import argparse
 import signal
+from PIL import Image
+import imagehash
+import magic
+import cv2
+import numpy as np
+from scenedetect import VideoManager, SceneManager
+from scenedetect.detectors import ContentDetector
 
 # Setup logging
 logging.basicConfig(filename='duplicate_finder.log', level=logging.INFO)
@@ -16,6 +23,7 @@ logging.basicConfig(filename='duplicate_finder.log', level=logging.INFO)
 COMMIT_THRESHOLD = 100
 INITIAL_HASH_SIZE = 1024 * 1024  # 1 MB
 MIN_FILE_SIZE = 1024  # Default minimum file size: 1 KB
+FUZZY_MATCH_THRESHOLD = 5  # Maximum allowed hamming distance for fuzzy match
 
 # Global connection and cursor
 main_conn = None
@@ -41,7 +49,7 @@ def init_db():
     main_conn = sqlite3.connect('file_hashes.db')
     main_cursor = main_conn.cursor()
     main_cursor.execute('''CREATE TABLE IF NOT EXISTS files
-                 (path TEXT PRIMARY KEY, size INTEGER, mtime REAL, initial_hash TEXT, crc32_hash TEXT, sha256_hash TEXT, inode INTEGER, processed BOOLEAN)''')
+                 (path TEXT PRIMARY KEY, size INTEGER, mtime REAL, initial_hash TEXT, crc32_hash TEXT, sha256_hash TEXT, inode INTEGER, perceptual_hash TEXT, video_hash TEXT, processed BOOLEAN)''')
     main_cursor.execute('''CREATE TABLE IF NOT EXISTS duplicates
                  (group_id INTEGER PRIMARY KEY AUTOINCREMENT, sha256_hash TEXT, paths TEXT)''')
     main_conn.commit()
@@ -97,6 +105,59 @@ def hash_sha256(path, debug):
     except Exception as e:
         logging.error(f"Error hashing file {path} with SHA-256: {e}")
         return None
+
+# Generate a perceptual hash for image files
+def hash_perceptual(path, debug):
+    try:
+        image = Image.open(path)
+        perceptual_hash = str(imagehash.phash(image))
+        if debug:
+            logging.debug(f"Perceptual hash for {path}: {perceptual_hash}")
+        return perceptual_hash
+    except Exception as e:
+        logging.error(f"Error generating perceptual hash for {path}: {e}")
+        return None
+
+# Generate a perceptual hash for video files
+def hash_video(path, debug):
+    try:
+        # Initialize VideoManager and SceneManager.
+        video_manager = VideoManager([path])
+        scene_manager = SceneManager()
+        scene_manager.add_detector(ContentDetector(threshold=30.0))
+
+        # Base timestamp at which each scene starts, and store a perceptual hash for the first frame.
+        video_manager.set_downscale_factor()
+        video_manager.start()
+        scene_manager.detect_scenes(frame_source=video_manager)
+        scene_list = scene_manager.get_scene_list()
+
+        video_manager.release()
+
+        cap = cv2.VideoCapture(path)
+        video_hashes = []
+        for scene in scene_list:
+            start, _ = scene
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start.get_frames())
+            ret, frame = cap.read()
+            if ret:
+                img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                video_hashes.append(str(imagehash.phash(img)))
+        cap.release()
+
+        video_hash = ''.join(video_hashes)
+        if debug:
+            logging.debug(f"Video hash for {path}: {video_hash}")
+        return video_hash
+    except Exception as e:
+        logging.error(f"Error generating video hash for {path}: {e}")
+        return None
+
+# Determine the file type
+def get_file_type(path):
+    mime = magic.Magic(mime=True)
+    file_type = mime.from_file(path)
+    return file_type
 
 # Scan a directory
 def scan_directory(directory, verbose, debug):
@@ -155,10 +216,19 @@ def process_files(file_info, verbose, debug):
             logging.debug(f"{path}: {result}")
         if not result or result[0] != mtime:
             initial_hash = hash_initial_bytes(path, size, debug)
+            crc32_hash = hash_crc32(path, debug)
+            sha256_hash = hash_sha256(path, debug)
+            perceptual_hash = None
+            video_hash = None
+            file_type = get_file_type(path)
+            if 'image' in file_type:
+                perceptual_hash = hash_perceptual(path, debug)
+            elif 'video' in file_type:
+                video_hash = hash_video(path, debug)
             if initial_hash:
                 try:
-                    c.execute("REPLACE INTO files (path, size, mtime, initial_hash, inode, processed) VALUES (?, ?, ?, ?, ?, ?)",
-                              (path, size, mtime, initial_hash, inode, False))
+                    c.execute("REPLACE INTO files (path, size, mtime, initial_hash, crc32_hash, sha256_hash, inode, perceptual_hash, video_hash, processed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                              (path, size, mtime, initial_hash, crc32_hash, sha256_hash, inode, perceptual_hash, video_hash, False))
                     if debug:
                         logging.debug(f"Inserted/Updated file {path} with initial hash {initial_hash}")
                     commit_count += 1
@@ -268,9 +338,29 @@ def find_duplicates(verbose, debug):
                         c.executemany("UPDATE files SET processed = 1 WHERE path = ?", [(f,) for f in sha256_hash_files])
                         conn.commit()
                     else:
+                        # Fuzzy matching
+                        file_type = get_file_type(file.strip())
+                        if 'image' in file_type:
+                            perceptual_hash = hash_perceptual(file.strip(), debug)
+                            for other_file in sha256_hash_files:
+                                other_perceptual_hash = hash_perceptual(other_file.strip(), debug)
+                                if perceptual_hash and other_perceptual_hash and perceptual_hash - other_perceptual_hash <= FUZZY_MATCH_THRESHOLD:
+                                    duplicates.append([file.strip(), other_file.strip()])
+                                    if verbose or debug:
+                                        print(f"fuzzy matched image {file.strip()} and {other_file.strip()}")
+                                        logging.info(f"  Fuzzy matched image {file.strip()} and {other_file.strip()}")
+                        elif 'video' in file_type:
+                            video_hash = hash_video(file.strip(), debug)
+                            for other_file in sha256_hash_files:
+                                other_video_hash = hash_video(other_file.strip(), debug)
+                                if video_hash and other_video_hash and video_hash == other_video_hash:
+                                    duplicates.append([file.strip(), other_file.strip()])
+                                    if verbose or debug:
+                                        print(f"fuzzy matched video {file.strip()} and {other_file.strip()}")
+                                        logging.info(f"  Fuzzy matched video {file.strip()} and {other_file.strip()}")
                         if verbose or debug:
                             print("no match")
-                            logging.info(f"  Duplicate group with SHA256 {sha256_hash} is false")
+                            logging.info(f"Duplicate group with CRC32 {crc32_hash} is false")
             else:
                 if verbose or debug:
                     print("no match")
