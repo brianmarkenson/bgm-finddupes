@@ -292,11 +292,18 @@ def find_duplicates(verbose, debug):
     for i, (size, initial_hash, paths) in enumerate(potential_duplicates):
         crc32_hash_dict = {}
         sha256_hash_dict = {}
+        inode_dict = {}
         files = paths.split(',')
         if verbose or debug:
             print(f"{files}: {size} {initial_hash}...", end="")
             logging.info(f"{files}: {size} {initial_hash}:")
         for file in files:
+            stat = os.stat(file)
+            inode = stat.st_ino
+            if inode in inode_dict:
+                logging.info(f"HARDLINK SKIP: {file} is a hard link to {inode_dict[inode]}")
+                continue  # Skip hard linked files
+            inode_dict[inode] = file
             crc32_hash = hash_crc32(file, debug)
             if crc32_hash:
                 if crc32_hash in crc32_hash_dict:
