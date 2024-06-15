@@ -184,16 +184,16 @@ def find_duplicates(verbose, debug):
     logging.info("Finding duplicates.")
     conn = sqlite3.connect('file_hashes.db')
     c = conn.cursor()
-    c.execute("SELECT initial_hash, GROUP_CONCAT(path) FROM files GROUP BY initial_hash HAVING COUNT(*) > 1")
+    c.execute("SELECT size, initial_hash, GROUP_CONCAT(path) FROM files GROUP BY size, initial_hash HAVING COUNT(*) > 1")
     potential_duplicates = c.fetchall()
 
     duplicates = []
     crc32_hash_dict = {}
-    for initial_hash, paths in potential_duplicates:
+    for size, initial_hash, paths in potential_duplicates:
         files = paths.split(',')
         if verbose or debug:
-            print(f"Possible duplicate found with initial hash {initial_hash}: {files}")
-            logging.info(f"Possible duplicate found with initial hash {initial_hash}: {files}")
+            print(f"Possible duplicate found with size {size} and initial hash {initial_hash}: {files}")
+            logging.info(f"Possible duplicate found with size {size} and initial hash {initial_hash}: {files}")
         for file in files:
             crc32_hash = hash_crc32(file, debug)
             if crc32_hash in crc32_hash_dict:
