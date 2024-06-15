@@ -15,18 +15,19 @@ logging.basicConfig(filename='duplicate_finder.log', level=logging.INFO)
 # Commit threshold and initial hash size
 COMMIT_THRESHOLD = 100
 INITIAL_HASH_SIZE = 1024 * 1024  # 1 MB
+MIN_FILE_SIZE = 1024  # 1 KB - Adjust this value as needed
 
 # Global connection and cursor
-conn = None
-c = None
+main_conn = None
+main_cursor = None
 
 # Signal handler for graceful shutdown
 def signal_handler(sig, frame):
-    global conn
-    if conn:
+    global main_conn
+    if main_conn:
         logging.info("Interrupted! Committing pending changes and closing database.")
-        conn.commit()
-        conn.close()
+        main_conn.commit()
+        main_conn.close()
     logging.info("Exiting gracefully.")
     sys.exit(0)
 
@@ -35,13 +36,13 @@ signal.signal(signal.SIGINT, signal_handler)
 
 # Initialize database
 def init_db():
-    global conn, c
+    global main_conn, main_cursor
     logging.info("Initializing database.")
-    conn = sqlite3.connect('file_hashes.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS files
-                 (path TEXT PRIMARY KEY, size INTEGER, mtime REAL, initial_hash TEXT, crc32_hash TEXT, sha256_hash TEXT, inode INTEGER)''')
-    conn.commit()
+    main_conn = sqlite3.connect('file_hashes.db')
+    main_cursor = main_conn.cursor()
+    main_cursor.execute('''CREATE TABLE IF NOT EXISTS files
+                 (path TEXT PRIMARY KEY, size INTEGER, mtime REAL, initial_hash TEXT, crc32_hash TEXT, sha256_hash TEXT, inode INTEGER, processed BOOLEAN)''')
+    main_conn.commit()
     logging.info("Database initialized.")
 
 # Hash the first x bytes of a file using CRC32 for faster hashing
@@ -125,6 +126,8 @@ def scan_directory(directory, verbose, debug):
                     continue  # Skip files that are hard linked
                 inode_to_path[inode] = path
                 size = stat.st_size
+                if size < MIN_FILE_SIZE:
+                    continue  # Skip files smaller than the minimum size
                 mtime = stat.st_mtime
                 file_info.append((path, size, mtime, inode))
                 if debug:
@@ -139,7 +142,8 @@ def scan_directory(directory, verbose, debug):
 # Process files
 def process_files(file_info, verbose, debug):
     logging.info(f"Processing {len(file_info)} files:")
-    global conn, c
+    conn = sqlite3.connect('file_hashes.db')
+    c = conn.cursor()
     processed_count = 0
     commit_count = 0
     for path, size, mtime, inode in file_info:
@@ -151,8 +155,8 @@ def process_files(file_info, verbose, debug):
             initial_hash = hash_initial_bytes(path, size, debug)
             if initial_hash:
                 try:
-                    c.execute("REPLACE INTO files (path, size, mtime, initial_hash, inode) VALUES (?, ?, ?, ?, ?)",
-                              (path, size, mtime, initial_hash, inode))
+                    c.execute("REPLACE INTO files (path, size, mtime, initial_hash, inode, processed) VALUES (?, ?, ?, ?, ?, ?)",
+                              (path, size, mtime, initial_hash, inode, False))
                     if debug:
                         logging.debug(f"Inserted/Updated file {path} with initial hash {initial_hash}")
                     commit_count += 1
@@ -175,12 +179,13 @@ def process_files(file_info, verbose, debug):
     if verbose:
         print(f"Processed {processed_count} files.")
     logging.info(f"Processed {processed_count} files.")
+    conn.close()
 
 # Count entries in the table
 def count_entries():
-    global conn, c
-    c.execute("SELECT COUNT(*) FROM files")
-    count = c.fetchone()[0]
+    global main_conn, main_cursor
+    main_cursor.execute("SELECT COUNT(*) FROM files")
+    count = main_cursor.fetchone()[0]
     logging.info(f"Database contains {count} entries.")
     return count
 
@@ -196,8 +201,10 @@ def verify_database(verbose, debug):
 # Find duplicates
 def find_duplicates(verbose, debug):
     logging.info("Finding duplicates.")
-    global conn, c
-    c.execute("SELECT size, initial_hash, GROUP_CONCAT(path) FROM files GROUP BY size, initial_hash HAVING COUNT(*) > 1")
+    conn = sqlite3.connect('file_hashes.db')
+    c = conn.cursor()
+    # Ensure we process any files that were marked as unprocessed before duplicate detection
+    c.execute("SELECT size, initial_hash, GROUP_CONCAT(path) FROM files WHERE processed = 0 GROUP BY size, initial_hash HAVING COUNT(*) > 1")
     potential_duplicates = c.fetchall()
 
     duplicates = []
@@ -231,10 +238,18 @@ def find_duplicates(verbose, debug):
                         if verbose or debug:
                             print(f"Duplicate group confirmed with SHA-256 hash {sha256_hash}: {sha256_hash_files}")
                             logging.info(f"Duplicate group confirmed with SHA-256 hash {sha256_hash}: {sha256_hash_files}")
+                        # Mark duplicates as processed to avoid reprocessing them
+                        c.executemany("UPDATE files SET processed = 1 WHERE path = ?", [(f,) for f in sha256_hash_files])
+                        conn.commit()
+
+    # Mark all files as processed
+    c.execute("UPDATE files SET processed = 1 WHERE processed = 0")
+    conn.commit()
 
     if verbose:
         print(f"Found {len(duplicates)} duplicate groups.")
     logging.info(f"Found {len(duplicates)} duplicate groups.")
+    conn.close()
     return duplicates
 
 # Generate linking script
@@ -273,11 +288,11 @@ def main(directories, verbose, debug):
         logging.debug("Completed main function.")
 
     # Force disk sync and perform VACUUM
-    global conn, c
-    c.execute("PRAGMA wal_checkpoint(FULL)")
-    c.execute("PRAGMA synchronous = FULL")
-    c.execute("VACUUM")
-    conn.close()
+    global main_conn, main_cursor
+    main_cursor.execute("PRAGMA wal_checkpoint(FULL)")
+    main_cursor.execute("PRAGMA synchronous = FULL")
+    main_cursor.execute("VACUUM")
+    main_conn.close()
     if debug:
         logging.debug("Performed PRAGMA wal_checkpoint, synchronous, and VACUUM.")
 
@@ -287,7 +302,10 @@ if __name__ == "__main__":
     parser.add_argument("directories", nargs='+', help="Directories to scan for duplicate files.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output.")
     parser.add_argument("--debug", action="store_true", help="Enable detailed debug output.")
+    parser.add_argument("--min-size", type=int, default=MIN_FILE_SIZE, help="Minimum file size for duplicate detection.")
     args = parser.parse_args()
+
+    MIN_FILE_SIZE = args.min_size
 
     logging.getLogger().setLevel(logging.DEBUG if args.debug else logging.INFO)
 
