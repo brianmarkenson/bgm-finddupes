@@ -1,6 +1,7 @@
 #!/usr/bin/env python3.9
 import os
 import hashlib
+import zlib
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 import logging
@@ -10,8 +11,9 @@ import argparse
 # Setup logging
 logging.basicConfig(filename='duplicate_finder.log', level=logging.INFO)
 
-# Commit threshold
+# Commit threshold and initial hash size
 COMMIT_THRESHOLD = 100
+INITIAL_HASH_SIZE = 1024 * 1024  # 1 MB
 
 # Initialize database
 def init_db():
@@ -19,25 +21,40 @@ def init_db():
     conn = sqlite3.connect('file_hashes.db')
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS files
-                 (path TEXT PRIMARY KEY, size INTEGER, mtime REAL, hash TEXT)''')
+                 (path TEXT PRIMARY KEY, size INTEGER, mtime REAL, initial_hash TEXT, full_hash TEXT, inode INTEGER)''')
     conn.commit()
     logging.info("Database initialized.")
     conn.close()
 
-# Hash a file
+# Hash the first x bytes of a file using CRC32 for faster hashing
+def hash_initial_bytes(path, size, debug):
+    crc32 = 0
+    try:
+        with open(path, 'rb') as f:
+            chunk = f.read(min(size, INITIAL_HASH_SIZE))
+            crc32 = zlib.crc32(chunk)
+        initial_hash = f"{crc32 & 0xFFFFFFFF:08x}"
+        if debug:
+            logging.debug(f"Initial hash for {path}: {initial_hash}")
+        return initial_hash
+    except Exception as e:
+        logging.error(f"Error hashing initial bytes of file {path}: {e}")
+        return None
+
+# Hash the entire file using CRC32 for faster hashing
 def hash_file(path, debug):
-    sha256 = hashlib.sha256()
+    crc32 = 0
     try:
         with open(path, 'rb') as f:
             while True:
-                chunk = f.read(8192)
+                chunk = f.read(65536)  # Read in 64 KB chunks
                 if not chunk:
                     break
-                sha256.update(chunk)
-        file_hash = sha256.hexdigest()
+                crc32 = zlib.crc32(chunk, crc32)
+        full_hash = f"{crc32 & 0xFFFFFFFF:08x}"
         if debug:
-            logging.debug(f"Hash for {path}: {file_hash}")
-        return file_hash
+            logging.debug(f"Full hash for {path}: {full_hash}")
+        return full_hash
     except Exception as e:
         logging.error(f"Error hashing file {path}: {e}")
         return None
@@ -46,15 +63,36 @@ def hash_file(path, debug):
 def scan_directory(directory, verbose, debug):
     logging.info(f"Scanning directory: {directory}")
     file_info = []
+    inode_to_path = {}
     for root, _, files in os.walk(directory):
         for file in files:
             path = os.path.join(root, file)
             try:
-                size = os.path.getsize(path)
-                mtime = os.path.getmtime(path)
-                file_info.append((path, size, mtime))
+                if os.path.islink(path):
+                    target_path = os.readlink(path)
+                    if os.path.exists(target_path):
+                        if verbose:
+                            print(f"softlink: {path} -> {target_path}")
+                        logging.info(f"softlink: {path} -> {target_path}")
+                        continue
+                    else:
+                        logging.warning(f"Softlink target does not exist: {path} -> {target_path}")
+                        if verbose:
+                            print(f"Softlink target does not exist: {path} -> {target_path}")
+                stat = os.stat(path)
+                inode = stat.st_ino
+                if inode in inode_to_path:
+                    hard_link_path = inode_to_path[inode]
+                    if verbose:
+                        print(f"{path} is hardlinked to {hard_link_path}")
+                    logging.info(f"{path} is hardlinked to {hard_link_path}")
+                    continue  # Skip files that are hard linked
+                inode_to_path[inode] = path
+                size = stat.st_size
+                mtime = stat.st_mtime
+                file_info.append((path, size, mtime, inode))
                 if debug:
-                    logging.debug(f"Found file {path} with size {size} and mtime {mtime}")
+                    logging.debug(f"Found file {path} with size {size}, mtime {mtime}, inode {inode}")
             except Exception as e:
                 logging.error(f"Error getting info for file {path}: {e}")
     if verbose:
@@ -69,18 +107,19 @@ def process_files(file_info, verbose, debug):
     c = conn.cursor()
     processed_count = 0
     commit_count = 0
-    for path, size, mtime in file_info:
-        c.execute("SELECT mtime FROM files WHERE path=?", (path,))
+    for path, size, mtime, inode in file_info:
+        c.execute("SELECT mtime, initial_hash, full_hash FROM files WHERE path=?", (path,))
         result = c.fetchone()
         if debug:
             logging.debug(f"{path}: {result}")
         if not result or result[0] != mtime:
-            file_hash = hash_file(path, debug)
-            if file_hash:
+            initial_hash = hash_initial_bytes(path, size, debug)
+            if initial_hash:
                 try:
-                    c.execute("REPLACE INTO files (path, size, mtime, hash) VALUES (?, ?, ?, ?)", (path, size, mtime, file_hash))
+                    c.execute("REPLACE INTO files (path, size, mtime, initial_hash, inode) VALUES (?, ?, ?, ?, ?)",
+                              (path, size, mtime, initial_hash, inode))
                     if debug:
-                        logging.debug(f"Inserted/Updated file {path} with hash {file_hash}")
+                        logging.debug(f"Inserted/Updated file {path} with initial hash {initial_hash}")
                     commit_count += 1
                     processed_count += 1
                     if commit_count >= COMMIT_THRESHOLD:
@@ -90,16 +129,9 @@ def process_files(file_info, verbose, debug):
                     if verbose:
                         print(f"{path}: {processed_count} files.")
                     logging.info(f"{path}: {processed_count} files.")
-                    # Verify the insertion if debugging
-                    if debug:
-                        count = count_entries()
-                        if count == 0:
-                            logging.error(f"Failed to insert file {path}")
-                        verify_database(verbose, debug)
                 except sqlite3.Error as e:
                     logging.error(f"Database error for file {path}: {e}")
                     conn.rollback()
-
     if commit_count > 0:
         conn.commit()
         logging.info(f"Final commit for remaining {commit_count} operations.")
@@ -134,8 +166,29 @@ def find_duplicates(verbose, debug):
     logging.info("Finding duplicates.")
     conn = sqlite3.connect('file_hashes.db')
     c = conn.cursor()
-    c.execute("SELECT hash, GROUP_CONCAT(path) FROM files GROUP BY hash HAVING COUNT(*) > 1")
-    duplicates = c.fetchall()
+    c.execute("SELECT initial_hash, GROUP_CONCAT(path) FROM files GROUP BY initial_hash HAVING COUNT(*) > 1")
+    potential_duplicates = c.fetchall()
+
+    duplicates = []
+    for initial_hash, paths in potential_duplicates:
+        files = paths.split(',')
+        if verbose or debug:
+            print(f"Possible duplicate found with initial hash {initial_hash}: {files}")
+            logging.info(f"Possible duplicate found with initial hash {initial_hash}: {files}")
+        full_hash_dict = {}
+        for file in files:
+            full_hash = hash_file(file, debug)
+            if full_hash in full_hash_dict:
+                full_hash_dict[full_hash].append(file)
+            else:
+                full_hash_dict[full_hash] = [file]
+        for full_hash_files in full_hash_dict.values():
+            if len(full_hash_files) > 1:
+                duplicates.append(full_hash_files)
+                if verbose or debug:
+                    print(f"Duplicate group identified with full hash {full_hash}: {full_hash_files}")
+                    logging.info(f"Duplicate group identified with full hash {full_hash}: {full_hash_files}")
+
     conn.close()
     if verbose:
         print(f"Found {len(duplicates)} duplicate groups.")
@@ -146,15 +199,13 @@ def find_duplicates(verbose, debug):
 def generate_link_script(duplicates, verbose, debug):
     logging.info("Generating linking script.")
     with open('link_script.sh', 'w') as f:
-        for file_hash, paths in duplicates:
-            files = paths.split(',')
-            if len(files) > 1:
-                keep = files[0]
-                for file in files[1:]:
-                    if os.path.samefile(os.path.dirname(keep), os.path.dirname(file)):
-                        f.write(f"ln -f {keep} {file}\n")
-                    else:
-                        f.write(f"ln -sf {keep} {file}\n")
+        for files in duplicates:
+            keep = files[0]
+            for file in files[1:]:
+                if os.path.samefile(os.path.dirname(keep), os.path.dirname(file)):
+                    f.write(f"ln -f {keep} {file}\n")
+                else:
+                    f.write(f"ln -sf {keep} {file}\n")
     if verbose:
         print(f"Linking script generated with {len(duplicates)} duplicate groups.")
     logging.info(f"Linking script generated with {len(duplicates)} duplicate groups.")
