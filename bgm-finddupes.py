@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import logging
 import sys
 import argparse
+import signal
 
 # Setup logging
 logging.basicConfig(filename='duplicate_finder.log', level=logging.INFO)
@@ -15,8 +16,26 @@ logging.basicConfig(filename='duplicate_finder.log', level=logging.INFO)
 COMMIT_THRESHOLD = 100
 INITIAL_HASH_SIZE = 1024 * 1024  # 1 MB
 
+# Global connection and cursor
+conn = None
+c = None
+
+# Signal handler for graceful shutdown
+def signal_handler(sig, frame):
+    global conn
+    if conn:
+        logging.info("Interrupted! Committing pending changes and closing database.")
+        conn.commit()
+        conn.close()
+    logging.info("Exiting gracefully.")
+    sys.exit(0)
+
+# Register signal handler
+signal.signal(signal.SIGINT, signal_handler)
+
 # Initialize database
 def init_db():
+    global conn, c
     logging.info("Initializing database.")
     conn = sqlite3.connect('file_hashes.db')
     c = conn.cursor()
@@ -24,7 +43,6 @@ def init_db():
                  (path TEXT PRIMARY KEY, size INTEGER, mtime REAL, initial_hash TEXT, crc32_hash TEXT, sha256_hash TEXT, inode INTEGER)''')
     conn.commit()
     logging.info("Database initialized.")
-    conn.close()
 
 # Hash the first x bytes of a file using CRC32 for faster hashing
 def hash_initial_bytes(path, size, debug):
@@ -121,8 +139,7 @@ def scan_directory(directory, verbose, debug):
 # Process files
 def process_files(file_info, verbose, debug):
     logging.info(f"Processing {len(file_info)} files:")
-    conn = sqlite3.connect('file_hashes.db')
-    c = conn.cursor()
+    global conn, c
     processed_count = 0
     commit_count = 0
     for path, size, mtime, inode in file_info:
@@ -155,18 +172,15 @@ def process_files(file_info, verbose, debug):
         logging.info(f"Final commit for remaining {commit_count} operations.")
     if verbose:
         print(f"Final commit for remaining {commit_count} operations.")
-    conn.close()
     if verbose:
         print(f"Processed {processed_count} files.")
     logging.info(f"Processed {processed_count} files.")
 
 # Count entries in the table
 def count_entries():
-    conn = sqlite3.connect('file_hashes.db')
-    c = conn.cursor()
+    global conn, c
     c.execute("SELECT COUNT(*) FROM files")
     count = c.fetchone()[0]
-    conn.close()
     logging.info(f"Database contains {count} entries.")
     return count
 
@@ -182,8 +196,7 @@ def verify_database(verbose, debug):
 # Find duplicates
 def find_duplicates(verbose, debug):
     logging.info("Finding duplicates.")
-    conn = sqlite3.connect('file_hashes.db')
-    c = conn.cursor()
+    global conn, c
     c.execute("SELECT size, initial_hash, GROUP_CONCAT(path) FROM files GROUP BY size, initial_hash HAVING COUNT(*) > 1")
     potential_duplicates = c.fetchall()
 
@@ -219,7 +232,6 @@ def find_duplicates(verbose, debug):
                             print(f"Duplicate group confirmed with SHA-256 hash {sha256_hash}: {sha256_hash_files}")
                             logging.info(f"Duplicate group confirmed with SHA-256 hash {sha256_hash}: {sha256_hash_files}")
 
-    conn.close()
     if verbose:
         print(f"Found {len(duplicates)} duplicate groups.")
     logging.info(f"Found {len(duplicates)} duplicate groups.")
@@ -261,8 +273,7 @@ def main(directories, verbose, debug):
         logging.debug("Completed main function.")
 
     # Force disk sync and perform VACUUM
-    conn = sqlite3.connect('file_hashes.db')
-    c = conn.cursor()
+    global conn, c
     c.execute("PRAGMA wal_checkpoint(FULL)")
     c.execute("PRAGMA synchronous = FULL")
     c.execute("VACUUM")
