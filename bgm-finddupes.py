@@ -15,7 +15,7 @@ logging.basicConfig(filename='duplicate_finder.log', level=logging.INFO)
 # Commit threshold and initial hash size
 COMMIT_THRESHOLD = 100
 INITIAL_HASH_SIZE = 1024 * 1024  # 1 MB
-MIN_FILE_SIZE = 1024  # 1 KB - Adjust this value as needed
+MIN_FILE_SIZE = 1024  # Default minimum file size: 1 KB
 
 # Global connection and cursor
 main_conn = None
@@ -42,6 +42,8 @@ def init_db():
     main_cursor = main_conn.cursor()
     main_cursor.execute('''CREATE TABLE IF NOT EXISTS files
                  (path TEXT PRIMARY KEY, size INTEGER, mtime REAL, initial_hash TEXT, crc32_hash TEXT, sha256_hash TEXT, inode INTEGER, processed BOOLEAN)''')
+    main_cursor.execute('''CREATE TABLE IF NOT EXISTS duplicates
+                 (group_id INTEGER PRIMARY KEY AUTOINCREMENT, sha256_hash TEXT, paths TEXT)''')
     main_conn.commit()
     logging.info("Database initialized.")
 
@@ -198,6 +200,23 @@ def verify_database(verbose, debug):
         logging.debug(f"Database contains {count} entries.")
     return count
 
+# Save duplicates in the database
+def save_duplicates(duplicates, conn, verbose, debug):
+    c = conn.cursor()
+    for duplicate_group in duplicates:
+        sha256_hash = duplicate_group[0]  # Assuming the first entry's hash represents the group
+        paths = ",".join(duplicate_group)
+        try:
+            c.execute("INSERT INTO duplicates (sha256_hash, paths) VALUES (?, ?)", (sha256_hash, paths))
+            if debug:
+                logging.debug(f"Saved duplicate group with SHA-256 hash {sha256_hash}: {paths}")
+        except sqlite3.Error as e:
+            logging.error(f"Error saving duplicate group {paths}: {e}")
+    conn.commit()
+    if verbose:
+        print(f"Saved {len(duplicates)} duplicate groups.")
+    logging.info(f"Saved {len(duplicates)} duplicate groups.")
+
 # Find duplicates
 def find_duplicates(verbose, debug):
     logging.info("Finding duplicates.")
@@ -209,17 +228,21 @@ def find_duplicates(verbose, debug):
 
     duplicates = []
     crc32_hash_dict = {}
-    for size, initial_hash, paths in potential_duplicates:
+    total_files = len(potential_duplicates)
+    for i, (size, initial_hash, paths) in enumerate(potential_duplicates):
         files = paths.split(',')
         if verbose or debug:
             print(f"Possible duplicate found with size {size} and initial hash {initial_hash}: {files}")
             logging.info(f"Possible duplicate found with size {size} and initial hash {initial_hash}: {files}")
         for file in files:
             crc32_hash = hash_crc32(file, debug)
-            if crc32_hash in crc32_hash_dict:
-                crc32_hash_dict[crc32_hash].append(file)
+            if crc32_hash:
+                if crc32_hash in crc32_hash_dict:
+                    crc32_hash_dict[crc32_hash].append(file)
+                else:
+                    crc32_hash_dict[crc32_hash] = [file]
             else:
-                crc32_hash_dict[crc32_hash] = [file]
+                logging.error(f"Failed to compute CRC32 hash for {file}")
         for crc32_hash, crc32_files in crc32_hash_dict.items():
             if len(crc32_files) > 1:
                 if verbose or debug:
@@ -228,10 +251,13 @@ def find_duplicates(verbose, debug):
                 sha256_hash_dict = {}
                 for file in crc32_files:
                     sha256_hash = hash_sha256(file, debug)
-                    if sha256_hash in sha256_hash_dict:
-                        sha256_hash_dict[sha256_hash].append(file)
+                    if sha256_hash:
+                        if sha256_hash in sha256_hash_dict:
+                            sha256_hash_dict[sha256_hash].append(file)
+                        else:
+                            sha256_hash_dict[sha256_hash] = [file]
                     else:
-                        sha256_hash_dict[sha256_hash] = [file]
+                        logging.error(f"Failed to compute SHA-256 hash for {file}")
                 for sha256_hash_files in sha256_hash_dict.values():
                     if len(sha256_hash_files) > 1:
                         duplicates.append(sha256_hash_files)
@@ -241,6 +267,13 @@ def find_duplicates(verbose, debug):
                         # Mark duplicates as processed to avoid reprocessing them
                         c.executemany("UPDATE files SET processed = 1 WHERE path = ?", [(f,) for f in sha256_hash_files])
                         conn.commit()
+        # Progress reporting
+        if verbose:
+            print(f"Processed {i + 1} out of {total_files} potential duplicate groups")
+        logging.info(f"Processed {i + 1} out of {total_files} potential duplicate groups")
+
+    # Save duplicates in the database
+    save_duplicates(duplicates, conn, verbose, debug)
 
     # Mark all files as processed
     c.execute("UPDATE files SET processed = 1 WHERE processed = 0")
@@ -305,6 +338,7 @@ if __name__ == "__main__":
     parser.add_argument("--min-size", type=int, default=MIN_FILE_SIZE, help="Minimum file size for duplicate detection.")
     args = parser.parse_args()
 
+    # Use the provided min size or default to MIN_FILE_SIZE
     MIN_FILE_SIZE = args.min_size
 
     logging.getLogger().setLevel(logging.DEBUG if args.debug else logging.INFO)
