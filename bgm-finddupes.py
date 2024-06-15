@@ -8,7 +8,6 @@ import logging
 import sys
 import argparse
 import signal
-import shlex
 from PIL import Image
 import imagehash
 import magic
@@ -267,7 +266,7 @@ def save_duplicates(duplicates, conn, verbose, debug):
     c = conn.cursor()
     for duplicate_group in duplicates:
         sha256_hash = duplicate_group[0]  # Assuming the first entry's hash represents the group
-        paths = ",".join(duplicate_group)
+        paths = "|||".join(duplicate_group)  # Use "|||" as the delimiter
         try:
             c.execute("INSERT INTO duplicates (sha256_hash, paths) VALUES (?, ?)", (sha256_hash, paths))
             if debug:
@@ -360,16 +359,15 @@ def generate_link_script(duplicates, verbose, debug):
     with open('link_script.sh', 'w') as f:
         for files in duplicates:
             keep = files[0]
-            print(f"{keep}")
             keep_fs = os.stat(keep).st_dev
             for file in files[1:]:
                 file_fs = os.stat(file).st_dev
-                keep_quoted = shlex.quote(keep)
-                file_quoted = shlex.quote(file)
+                escaped_keep = keep.replace(" ", "\\ ").replace("(", "\\(").replace(")", "\\)").replace("'", "\\'").replace(",", "\\,").replace("&", "\\&")
+                escaped_file = file.replace(" ", "\\ ").replace("(", "\\(").replace(")", "\\)").replace("'", "\\'").replace(",", "\\,").replace("&", "\\&")
                 if keep_fs == file_fs:
-                    f.write(f'ln -f {keep_quoted} {file_quoted}\n')
+                    f.write(f'ln -f {escaped_keep} {escaped_file}\n')
                 else:
-                    f.write(f'ln -sf {keep_quoted} {file_quoted}\n')
+                    f.write(f'ln -sf {escaped_keep} {escaped_file}\n')
     if verbose:
         print(f"Linking script generated with {len(duplicates)} duplicate groups.")
     logging.info(f"Linking script generated with {len(duplicates)} duplicate groups.")
@@ -446,7 +444,7 @@ if __name__ == "__main__":
         main_conn = sqlite3.connect('file_hashes.db')
         main_cursor = main_conn.cursor()
         main_cursor.execute("SELECT paths FROM duplicates")
-        duplicates = [row[0].split(',') for row in main_cursor.fetchall()]
+        duplicates = [row[0].split('|||') for row in main_cursor.fetchall()]  # Split using the "|||" delimiter
         generate_link_script(duplicates, args.verbose, args.debug)
     else:
         try:
@@ -454,4 +452,3 @@ if __name__ == "__main__":
         except Exception as e:
             logging.error(f"Unhandled exception: {e}")
             print(f"Unhandled exception: {e}")
-
