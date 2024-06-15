@@ -172,20 +172,20 @@ def scan_directory(directory, verbose, debug):
                     target_path = os.readlink(path)
                     if os.path.exists(target_path):
                         if verbose:
-                            print(f"softlink: {path} -> {target_path}")
-                        logging.info(f"softlink: {path} -> {target_path}")
+                            print(f"SOFTLINK: {path} -> {target_path}")
+                        logging.info(f"SOFTLINK: {path} -> {target_path}")
                         continue
                     else:
-                        logging.warning(f"Softlink target does not exist: {path} -> {target_path}")
+                        logging.warning(f"SOFTLINK: target does not exist {path} -> {target_path}")
                         if verbose:
-                            print(f"Softlink target does not exist: {path} -> {target_path}")
+                            print(f"SOFTLINK: target does not exist {path} -> {target_path}")
                 stat = os.stat(path)
                 inode = stat.st_ino
                 if inode in inode_to_path:
                     hard_link_path = inode_to_path[inode]
                     if verbose:
-                        print(f"{path} is hardlinked to {hard_link_path}")
-                    logging.info(f"{path} is hardlinked to {hard_link_path}")
+                        print(f"HARDLINK: {path} -> {hard_link_path}")
+                    logging.info(f"HARDLINK: {path} -> {hard_link_path}")
                     continue  # Skip files that are hard linked
                 inode_to_path[inode] = path
                 size = stat.st_size
@@ -290,7 +290,8 @@ def find_duplicates(verbose, debug):
     duplicates = []
     total_files = len(potential_duplicates)
     for i, (size, initial_hash, paths) in enumerate(potential_duplicates):
-        crc32_hash_dict = {}  # Reset for each potential duplicate group
+        crc32_hash_dict = {}
+        sha256_hash_dict = {}
         files = paths.split(',')
         if verbose or debug:
             print(f"{files}: {size} {initial_hash}...", end="")
@@ -309,7 +310,6 @@ def find_duplicates(verbose, debug):
                 if verbose or debug:
                     print(f"CRC32 Full hash {crc32_hash}...", end="")
                     logging.info(f"  CRC32 Full hash {crc32_hash}...")
-                sha256_hash_dict = {}  # Reset for each potential duplicate group
                 for file in crc32_files:
                     sha256_hash = hash_sha256(file, debug)
                     if sha256_hash:
@@ -362,10 +362,12 @@ def generate_link_script(duplicates, verbose, debug):
             keep_fs = os.stat(keep).st_dev
             for file in files[1:]:
                 file_fs = os.stat(file).st_dev
+                escaped_keep = keep.replace('"', '\\"')
+                escaped_file = file.replace('"', '\\"')
                 if keep_fs == file_fs:
-                    f.write(f'ln -f "{keep}" "{file}"\n')
+                    f.write(f'ln -f "{escaped_keep}" "{escaped_file}"\n')
                 else:
-                    f.write(f'ln -sf "{keep}" "{file}"\n')
+                    f.write(f'ln -sf "{escaped_keep}" "{escaped_file}"\n')
     if verbose:
         print(f"Linking script generated with {len(duplicates)} duplicate groups.")
     logging.info(f"Linking script generated with {len(duplicates)} duplicate groups.")
@@ -378,20 +380,19 @@ def reset_processed():
     main_conn.commit()
     logging.info("Processed flag reset.")
 
-# Function to update delimiter in duplicates table
+# Function to update the delimiter in the duplicates table
 def update_delimiter_in_duplicates():
     global main_conn, main_cursor
-    logging.info("Updating delimiter in duplicates table.")
+    logging.info("Updating delimiter in the duplicates table.")
     main_cursor.execute("SELECT group_id, paths FROM duplicates")
     rows = main_cursor.fetchall()
     for row in rows:
         group_id, paths = row
-        if ',' in paths:
-            new_paths = paths.replace(',', '|||')
-            main_cursor.execute("UPDATE duplicates SET paths = ? WHERE group_id = ?", (new_paths, group_id))
-            print(f"Updated group_id {group_id} paths to: {new_paths}")
+        new_paths = paths.replace(',', '|||')
+        logging.info(f"Updating group_id {group_id} with paths {new_paths}")
+        main_cursor.execute("UPDATE duplicates SET paths = ? WHERE group_id = ?", (new_paths, group_id))
     main_conn.commit()
-    logging.info("Delimiter update complete.")
+    logging.info("Delimiter update completed.")
 
 # Main function
 def main(directories, verbose, debug, reset, update_delimiter):
@@ -403,33 +404,22 @@ def main(directories, verbose, debug, reset, update_delimiter):
     if reset:
         reset_processed()
     count_entries()
-    if directories:
-        with ThreadPoolExecutor() as executor:
-            futures = []
-            for directory in directories:
-                file_info = scan_directory(directory, verbose, debug)
-                futures.append(executor.submit(process_files, file_info, verbose, debug))
-            for future in futures:
-                future.result()
-        if debug:
-            verify_database(verbose, debug)
-        duplicates = find_duplicates(verbose, debug)
-        generate_link_script(duplicates, verbose, debug)
-    else:
-        if args.list_duplicates:
-            main_cursor.execute("SELECT * FROM duplicates")
-            duplicates = main_cursor.fetchall()
-            if verbose:
-                for duplicate in duplicates:
-                    print(duplicate)
-            else:
-                print(f"Found {len(duplicates)} duplicate groups.")
-        elif args.generate_links:
-            main_cursor.execute("SELECT paths FROM duplicates")
-            duplicates = [row[0].split('|||') for row in main_cursor.fetchall()]  # Split using the "|||" delimiter
-            generate_link_script(duplicates, verbose, debug)
-    
+    with ThreadPoolExecutor() as executor:
+        futures = []
+        for directory in directories:
+            file_info = scan_directory(directory, verbose, debug)
+            futures.append(executor.submit(process_files, file_info, verbose, debug))
+        for future in futures:
+            future.result()
+    if debug:
+        verify_database(verbose, debug)
+    duplicates = find_duplicates(verbose, debug)
+    generate_link_script(duplicates, verbose, debug)
+    if debug:
+        logging.debug("Completed main function.")
+
     # Force disk sync and perform VACUUM
+    global main_conn, main_cursor
     main_cursor.execute("PRAGMA wal_checkpoint(FULL)")
     main_cursor.execute("PRAGMA synchronous = FULL")
     main_cursor.execute("VACUUM")
@@ -456,8 +446,26 @@ if __name__ == "__main__":
 
     logging.getLogger().setLevel(logging.DEBUG if args.debug else logging.INFO)
 
-    try:
-        main(args.directories, args.verbose, args.debug, args.reset, args.update_delimiter)
-    except Exception as e:
-        logging.error(f"Unhandled exception: {e}")
-        print(f"Unhandled exception: {e}")
+    if args.list_duplicates:
+        main_conn = sqlite3.connect('file_hashes.db')
+        main_cursor = main_conn.cursor()
+        main_cursor.execute("SELECT * FROM duplicates")
+        duplicates = main_cursor.fetchall()
+        if args.verbose:
+            for duplicate in duplicates:
+                print(duplicate)
+        else:
+            print(f"Found {len(duplicates)} duplicate groups.")
+        main_conn.close()
+    elif args.generate_links:
+        main_conn = sqlite3.connect('file_hashes.db')
+        main_cursor = main_conn.cursor()
+        main_cursor.execute("SELECT paths FROM duplicates")
+        duplicates = [row[0].split('|||') for row in main_cursor.fetchall()]  # Split using the "|||" delimiter
+        generate_link_script(duplicates, args.verbose, args.debug)
+    else:
+        try:
+            main(args.directories, args.verbose, args.debug, args.reset, args.update_delimiter)
+        except Exception as e:
+            logging.error(f"Unhandled exception: {e}")
+            print(f"Unhandled exception: {e}")
