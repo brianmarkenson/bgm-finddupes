@@ -223,26 +223,26 @@ def find_duplicates(verbose, debug):
     conn = sqlite3.connect('file_hashes.db')
     c = conn.cursor()
     # Ensure we process any files that were marked as unprocessed before duplicate detection
-    c.execute("SELECT size, initial_hash, GROUP_CONCAT(path) FROM files WHERE processed = 0 GROUP BY size, initial_hash HAVING COUNT(*) > 1")
+    c.execute("SELECT size, initial_hash, GROUP_CONCAT(path, '|||') FROM files WHERE processed = 0 GROUP BY size, initial_hash HAVING COUNT(*) > 1")
     potential_duplicates = c.fetchall()
 
     duplicates = []
-    crc32_hash_dict = {}
     total_files = len(potential_duplicates)
     for i, (size, initial_hash, paths) in enumerate(potential_duplicates):
-        files = paths.split(',')
+        files = paths.split('|||')
+        crc32_hash_dict = {}  # Reinitialize for each group
         if verbose or debug:
             print(f"{files}: {size} {initial_hash}...", end="")
             logging.info(f"{files}: {size} {initial_hash}:")
         for file in files:
-            crc32_hash = hash_crc32(file, debug)
+            crc32_hash = hash_crc32(file.strip(), debug)  # Ensure to strip any extra spaces
             if crc32_hash:
                 if crc32_hash in crc32_hash_dict:
-                    crc32_hash_dict[crc32_hash].append(file)
+                    crc32_hash_dict[crc32_hash].append(file.strip())
                 else:
-                    crc32_hash_dict[crc32_hash] = [file]
+                    crc32_hash_dict[crc32_hash] = [file.strip()]
             else:
-                logging.error(f"  Failed to compute CRC32 hash for {file}")
+                logging.error(f"  Failed to compute CRC32 hash for {file.strip()}")
         for crc32_hash, crc32_files in crc32_hash_dict.items():
             if len(crc32_files) > 1:
                 if verbose or debug:
@@ -250,14 +250,14 @@ def find_duplicates(verbose, debug):
                     logging.info(f"  CRC32 Full hash {crc32_hash}...")
                 sha256_hash_dict = {}
                 for file in crc32_files:
-                    sha256_hash = hash_sha256(file, debug)
+                    sha256_hash = hash_sha256(file.strip(), debug)
                     if sha256_hash:
                         if sha256_hash in sha256_hash_dict:
-                            sha256_hash_dict[sha256_hash].append(file)
+                            sha256_hash_dict[sha256_hash].append(file.strip())
                         else:
-                            sha256_hash_dict[sha256_hash] = [file]
+                            sha256_hash_dict[sha256_hash] = [file.strip()]
                     else:
-                        logging.error(f"  Failed to compute SHA-256 hash for {file}")
+                        logging.error(f"  Failed to compute SHA-256 hash for {file.strip()}")
                 for sha256_hash, sha256_hash_files in sha256_hash_dict.items():
                     if len(sha256_hash_files) > 1:
                         duplicates.append(sha256_hash_files)
@@ -270,11 +270,11 @@ def find_duplicates(verbose, debug):
                     else:
                         if verbose or debug:
                             print("no match")
-                            logging.info("Duplicate group with CRC32 {crc32_hash} is false")
+                            logging.info(f"  Duplicate group with SHA256 {sha256_hash} is false")
             else:
                 if verbose or debug:
                     print("no match")
-                    logging.info("  Duplicate group with CRC32 {crc32_hash} is false")
+                    logging.info(f"  Duplicate group with CRC32 {crc32_hash} is false")
         # Progress reporting
         if verbose:
             print(f"Processed {i + 1} out of {total_files} potential duplicate groups")
