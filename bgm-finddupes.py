@@ -391,9 +391,9 @@ def generate_link_script(duplicates, verbose, debug):
             keep = files[0]
             for file in files[1:]:
                 if os.path.samefile(os.path.dirname(keep), os.path.dirname(file)):
-                    f.write(f"ln -f {keep} {file}\n")
+                    f.write(f"ln -f \"{keep}\" \"{file}\"\n")
                 else:
-                    f.write(f"ln -sf {keep} {file}\n")
+                    f.write(f"ln -sf \"{keep}\" \"{file}\"\n")
     if verbose:
         print(f"Linking script generated with {len(duplicates)} duplicate groups.")
     logging.info(f"Linking script generated with {len(duplicates)} duplicate groups.")
@@ -406,30 +406,54 @@ def reset_processed():
     main_conn.commit()
     logging.info("Processed flag reset.")
 
+# Output list of detected duplicates
+def output_duplicates():
+    conn = sqlite3.connect('file_hashes.db')
+    c = conn.cursor()
+    c.execute("SELECT sha256_hash, paths FROM duplicates")
+    duplicates = c.fetchall()
+    for sha256_hash, paths in duplicates:
+        print(f"SHA-256: {sha256_hash}")
+        print(f"Paths: {paths}")
+        print("="*40)
+    conn.close()
+
 # Main function
-def main(directories, verbose, debug, reset):
+def main(directories, verbose, debug, reset, list_duplicates, generate_links):
+    global main_conn, main_cursor
     if debug:
         logging.debug("Starting main function.")
+    if list_duplicates:
+        output_duplicates()
+        return
     init_db()
     if reset:
         reset_processed()
-    count_entries()
-    with ThreadPoolExecutor() as executor:
-        futures = []
-        for directory in directories:
-            file_info = scan_directory(directory, verbose, debug)
-            futures.append(executor.submit(process_files, file_info, verbose, debug))
-        for future in futures:
-            future.result()
-    if debug:
-        verify_database(verbose, debug)
-    duplicates = find_duplicates(verbose, debug)
+    if not generate_links:
+        count_entries()
+        with ThreadPoolExecutor() as executor:
+            futures = []
+            for directory in directories:
+                file_info = scan_directory(directory, verbose, debug)
+                futures.append(executor.submit(process_files, file_info, verbose, debug))
+            for future in futures:
+                future.result()
+        if debug:
+            verify_database(verbose, debug)
+        duplicates = find_duplicates(verbose, debug)
+        save_duplicates(duplicates, main_conn, verbose, debug)
+    else:
+        duplicates = []
+        conn = sqlite3.connect('file_hashes.db')
+        c = conn.cursor()
+        c.execute("SELECT sha256_hash, paths FROM duplicates")
+        duplicates = c.fetchall()
+        conn.close()
     generate_link_script(duplicates, verbose, debug)
     if debug:
         logging.debug("Completed main function.")
 
     # Force disk sync and perform VACUUM
-    global main_conn, main_cursor
     main_cursor.execute("PRAGMA wal_checkpoint(FULL)")
     main_cursor.execute("PRAGMA synchronous = FULL")
     main_cursor.execute("VACUUM")
@@ -440,11 +464,13 @@ def main(directories, verbose, debug, reset):
 # Example usage
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Find duplicate files and generate linking script.")
-    parser.add_argument("directories", nargs='+', help="Directories to scan for duplicate files.")
+    parser.add_argument("directories", nargs='*', help="Directories to scan for duplicate files.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output.")
     parser.add_argument("--debug", action="store_true", help="Enable detailed debug output.")
     parser.add_argument("--min-size", type=int, default=MIN_FILE_SIZE, help="Minimum file size for duplicate detection.")
     parser.add_argument("--reset", action="store_true", help="Reset the processed flag for all files.")
+    parser.add_argument("--list-duplicates", action="store_true", help="Output list of detected duplicates.")
+    parser.add_argument("--generate-links", action="store_true", help="Generate link script from detected duplicates.")
     args = parser.parse_args()
 
     # Use the provided min size or default to MIN_FILE_SIZE
@@ -453,7 +479,7 @@ if __name__ == "__main__":
     logging.getLogger().setLevel(logging.DEBUG if args.debug else logging.INFO)
 
     try:
-        main(args.directories, args.verbose, args.debug, args.reset)
+        main(args.directories, args.verbose, args.debug, args.reset, args.list_duplicates, args.generate_links)
     except Exception as e:
         logging.error(f"Unhandled exception: {e}")
         print(f"Unhandled exception: {e}")
