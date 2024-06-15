@@ -362,12 +362,10 @@ def generate_link_script(duplicates, verbose, debug):
             keep_fs = os.stat(keep).st_dev
             for file in files[1:]:
                 file_fs = os.stat(file).st_dev
-                escaped_keep = keep.replace(" ", "\\ ").replace("(", "\\(").replace(")", "\\)").replace("'", "\\'").replace(",", "\\,").replace("&", "\\&")
-                escaped_file = file.replace(" ", "\\ ").replace("(", "\\(").replace(")", "\\)").replace("'", "\\'").replace(",", "\\,").replace("&", "\\&")
                 if keep_fs == file_fs:
-                    f.write(f'ln -f {escaped_keep} {escaped_file}\n')
+                    f.write(f'ln -f "{keep}" "{file}"\n')
                 else:
-                    f.write(f'ln -sf {escaped_keep} {escaped_file}\n')
+                    f.write(f'ln -sf "{keep}" "{file}"\n')
     if verbose:
         print(f"Linking script generated with {len(duplicates)} duplicate groups.")
     logging.info(f"Linking script generated with {len(duplicates)} duplicate groups.")
