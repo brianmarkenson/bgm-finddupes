@@ -188,32 +188,36 @@ def find_duplicates(verbose, debug):
     potential_duplicates = c.fetchall()
 
     duplicates = []
+    crc32_hash_dict = {}
     for initial_hash, paths in potential_duplicates:
         files = paths.split(',')
         if verbose or debug:
             print(f"Possible duplicate found with initial hash {initial_hash}: {files}")
             logging.info(f"Possible duplicate found with initial hash {initial_hash}: {files}")
-        crc32_hash_dict = {}
         for file in files:
             crc32_hash = hash_crc32(file, debug)
             if crc32_hash in crc32_hash_dict:
                 crc32_hash_dict[crc32_hash].append(file)
             else:
                 crc32_hash_dict[crc32_hash] = [file]
-        for crc32_hash_files in crc32_hash_dict.values():
-            sha256_hash_dict = {}
-            for file in crc32_hash_files:
-                sha256_hash = hash_sha256(file, debug)
-                if sha256_hash in sha256_hash_dict:
-                    sha256_hash_dict[sha256_hash].append(file)
-                else:
-                    sha256_hash_dict[sha256_hash] = [file]
-            for sha256_hash_files in sha256_hash_dict.values():
-                if len(sha256_hash_files) > 1:
-                    duplicates.append(sha256_hash_files)
-                    if verbose or debug:
-                        print(f"Duplicate group identified with SHA-256 hash {sha256_hash}: {sha256_hash_files}")
-                        logging.info(f"Duplicate group identified with SHA-256 hash {sha256_hash}: {sha256_hash_files}")
+        for crc32_hash, crc32_files in crc32_hash_dict.items():
+            if len(crc32_files) > 1:
+                if verbose or debug:
+                    print(f"Possible duplicate found with CRC32 hash {crc32_hash}: {crc32_files}")
+                    logging.info(f"Possible duplicate found with CRC32 hash {crc32_hash}: {crc32_files}")
+                sha256_hash_dict = {}
+                for file in crc32_files:
+                    sha256_hash = hash_sha256(file, debug)
+                    if sha256_hash in sha256_hash_dict:
+                        sha256_hash_dict[sha256_hash].append(file)
+                    else:
+                        sha256_hash_dict[sha256_hash] = [file]
+                for sha256_hash_files in sha256_hash_dict.values():
+                    if len(sha256_hash_files) > 1:
+                        duplicates.append(sha256_hash_files)
+                        if verbose or debug:
+                            print(f"Duplicate group confirmed with SHA-256 hash {sha256_hash}: {sha256_hash_files}")
+                            logging.info(f"Duplicate group confirmed with SHA-256 hash {sha256_hash}: {sha256_hash_files}")
 
     conn.close()
     if verbose:
