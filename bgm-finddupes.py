@@ -363,9 +363,9 @@ def generate_link_script(duplicates, verbose, debug):
             for file in files[1:]:
                 file_fs = os.stat(file).st_dev
                 if keep_fs == file_fs:
-                    f.write(f'ln -f "{keep}" "{file}"\n')
+                    f.write(f'{shlex.quote(keep)} {shlex.quote(file)}\n')
                 else:
-                    f.write(f'ln -sf "{keep}" "{file}"\n')
+                    f.write(f'{shlex.quote(keep)} {shlex.quote(file)}\n')
     if verbose:
         print(f"Linking script generated with {len(duplicates)} duplicate groups.")
     logging.info(f"Linking script generated with {len(duplicates)} duplicate groups.")
