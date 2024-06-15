@@ -18,17 +18,16 @@ import numpy as np
 from scenedetect import VideoManager, SceneManager
 from scenedetect.detectors import ContentDetector
 
-
-# Create a custom logger
+# Initialize logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-# Create handlers
+# Create logging handlers
 console_handler = logging.StreamHandler()
 rotating_file_handler = RotatingFileHandler('duplicate_finder.log', maxBytes=5000000, backupCount=5)
 rotating_file_handler.setLevel(logging.DEBUG)
 
-# Create formatters and add them to handlers
+# Create formatters and add to handlers
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', '%Y-%m-%d %H:%M:%S')
 console_handler.setFormatter(formatter)
 rotating_file_handler.setFormatter(formatter)
@@ -39,18 +38,20 @@ logger.addHandler(rotating_file_handler)
 
 rotating_file_handler.doRollover()
 
-# Commit threshold and initial hash size
-COMMIT_THRESHOLD = 100
-INITIAL_HASH_SIZE = 1024 * 1024  # 1 MB
-MIN_FILE_SIZE = 1024  # Default minimum file size: 1 KB
-FUZZY_MATCH_THRESHOLD = 5  # Maximum allowed hamming distance for fuzzy match
+# Constants
+COMMIT_THRESHOLD = 100  # Threshold for database commits
+INITIAL_HASH_SIZE = 1024 * 1024  # Initial hash size: 1 MB
+MIN_FILE_SIZE = 1024  # Minimum file size: 1 KB
+FUZZY_MATCH_THRESHOLD = 5  # Maximum allowed Hamming distance for fuzzy match
 
-# Global connection and cursor
+# Global database connection and cursor
 main_conn = None
 main_cursor = None
 
-# Signal handler for graceful shutdown
 def signal_handler(sig, frame):
+    """
+    Handle system signals for graceful shutdown.
+    """
     global main_conn
     if main_conn:
         logger.info("Interrupted! Committing pending changes and closing database.")
@@ -59,25 +60,41 @@ def signal_handler(sig, frame):
     logger.info("Exiting gracefully.")
     sys.exit(0)
 
-# Register signal handler
+# Register signal handler for graceful shutdown
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-# Initialize database
 def init_db():
+    """
+    Initialize the SQLite database and create necessary tables.
+    """
     global main_conn, main_cursor
-    logger.info("Initializing database.")
-    main_conn = sqlite3.connect('file_hashes.db')
-    main_cursor = main_conn.cursor()
-    main_cursor.execute('''CREATE TABLE IF NOT EXISTS files
-                 (path TEXT PRIMARY KEY, size INTEGER, mtime REAL, initial_hash TEXT, crc32_hash TEXT, sha256_hash TEXT, inode INTEGER, perceptual_hash TEXT, video_hash TEXT, processed BOOLEAN)''')
-    main_cursor.execute('''CREATE TABLE IF NOT EXISTS duplicates
-                 (group_id INTEGER PRIMARY KEY AUTOINCREMENT, sha256_hash TEXT, paths TEXT)''')
-    main_conn.commit()
-    logger.info("Database initialized.")
+    try:
+        logger.info("Initializing database.")
+        main_conn = sqlite3.connect('file_hashes.db')
+        main_cursor = main_conn.cursor()
+        main_cursor.execute('''CREATE TABLE IF NOT EXISTS files
+                     (path TEXT PRIMARY KEY, size INTEGER, mtime REAL, initial_hash TEXT, crc32_hash TEXT, sha256_hash TEXT, inode INTEGER, perceptual_hash TEXT, video_hash TEXT, processed BOOLEAN, hardlinked BOOLEAN DEFAULT 0)''')
+        main_cursor.execute('''CREATE TABLE IF NOT EXISTS duplicates
+                     (group_id INTEGER PRIMARY KEY AUTOINCREMENT, sha256_hash TEXT, paths TEXT)''')
+        main_conn.commit()
+        logger.info("Database initialized.")
+    except sqlite3.Error as e:
+        logger.error(f"Database initialization error: {e}")
+        sys.exit(1)
 
-# Hash the first x bytes of a file using CRC32 for faster hashing
 def hash_initial_bytes(path, size, debug):
+    """
+    Hash the first x bytes of a file using CRC32 for faster hashing.
+    
+    Parameters:
+    path (str): Path to the file.
+    size (int): Size of the file.
+    debug (bool): Enable debug logging.
+    
+    Returns:
+    str: Initial hash as a hexadecimal string.
+    """
     crc32 = 0
     try:
         with open(path, 'rb') as f:
@@ -95,8 +112,17 @@ def hash_initial_bytes(path, size, debug):
         logger.error(f"Error hashing initial bytes of file {path}: {e}")
     return None
 
-# Hash the entire file using CRC32 for faster initial duplicate detection
 def hash_crc32(path, debug):
+    """
+    Hash the entire file using CRC32 for faster initial duplicate detection.
+    
+    Parameters:
+    path (str): Path to the file.
+    debug (bool): Enable debug logging.
+    
+    Returns:
+    str: CRC32 hash as a hexadecimal string.
+    """
     crc32 = 0
     try:
         with open(path, 'rb') as f:
@@ -117,15 +143,21 @@ def hash_crc32(path, debug):
         logger.error(f"Error hashing file {path} with CRC32: {e}")
     return None
 
-# Hash the entire file using SHA-256 for robust verification
 def hash_sha256(path, debug):
+    """
+    Hash the entire file using SHA-256 for robust verification.
+    
+    Parameters:
+    path (str): Path to the file.
+    debug (bool): Enable debug logging.
+    
+    Returns:
+    str: SHA-256 hash as a hexadecimal string.
+    """
     sha256 = hashlib.sha256()
     try:
         with open(path, 'rb') as f:
-            while True:
-                chunk = f.read(65536)  # Read in 64 KB chunks
-                if not chunk:
-                    break
+            for chunk in iter(lambda: f.read(65536), b''):
                 sha256.update(chunk)
         sha256_hash = sha256.hexdigest()
         if debug:
@@ -139,8 +171,17 @@ def hash_sha256(path, debug):
         logger.error(f"Error hashing file {path} with SHA-256: {e}")
     return None
 
-# Generate a perceptual hash for image files
 def hash_perceptual(path, debug):
+    """
+    Generate a perceptual hash for image files.
+    
+    Parameters:
+    path (str): Path to the image file.
+    debug (bool): Enable debug logging.
+    
+    Returns:
+    str: Perceptual hash as a hexadecimal string.
+    """
     try:
         image = Image.open(path)
         perceptual_hash = str(imagehash.phash(image))
@@ -157,8 +198,18 @@ def hash_perceptual(path, debug):
         logger.error(f"Error generating perceptual hash for {path}: {e}")
     return None
 
-# Generate a perceptual hash for video files
-def hash_video(path, debug, frame_intervals=[150, 300, 450]):  # Analyze frames at 5s, 10s, 15s intervals
+def hash_video(path, debug, frame_intervals=[150, 300, 450]):
+    """
+    Generate a perceptual hash for video files by analyzing frames at specified intervals.
+    
+    Parameters:
+    path (str): Path to the video file.
+    debug (bool): Enable debug logging.
+    frame_intervals (list): List of frame intervals (in seconds) to analyze.
+    
+    Returns:
+    str: Combined perceptual hash of the analyzed frames.
+    """
     try:
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
@@ -194,58 +245,74 @@ def hash_video(path, debug, frame_intervals=[150, 300, 450]):  # Analyze frames 
         logger.error(f"Error generating video hash for {path}: {e}")
     return None
 
-# Scan a directory
 def scan_directory(directory, verbose, debug):
+    """
+    Scan a directory for files and gather their information.
+
+    Parameters:
+    directory (str): Directory to scan.
+    verbose (bool): Enable verbose logging.
+    debug (bool): Enable debug logging.
+
+    Returns:
+    list: List of tuples containing file information (path, size, mtime, inode).
+    """
     logger.info(f"Scanning directory: {directory}")
     file_info = []
-    inode_to_path = {}
     try:
-        total_files = 0
         for root, _, files in os.walk(directory):
-            total_files += len(files)
             for file in files:
                 path = os.path.join(root, file)
-                try:
-                    if os.path.islink(path):
-                        target_path = os.readlink(path)
-                        if os.path.exists(target_path):
-                            logger.info(f"SOFTLINK: {path} -> {target_path}")
-                            continue
-                        else:
-                            logger.info(f"Softlink target does not exist: {path} -> {target_path}")
-                    stat = os.stat(path)
-                    inode = stat.st_ino
-                    inode_to_path[inode] = path
-                    size = stat.st_size
-                    if size < MIN_FILE_SIZE:
-                        continue  # Skip files smaller than the minimum size
-                    mtime = stat.st_mtime
-                    file_info.append((path, size, mtime, inode))
+                
+                # Skip symbolic links
+                if os.path.islink(path):
                     if debug:
-                        logger.debug(f"Found file {path} with size {size}, mtime {mtime}, inode {inode}")
-                except FileNotFoundError:
-                    logger.error(f"File not found: {path}")
-                except PermissionError:
-                    logger.error(f"Permission denied: {path}")
+                        logger.debug(f"Skipping symbolic link: {path}")
+                    continue
+                
+                try:
+                    # Get file statistics
+                    stat = os.stat(path)
+                    
+                    # Skip files smaller than the minimum size
+                    if stat.st_size < MIN_FILE_SIZE:
+                        continue
+                    
+                    # Append file information to the list
+                    file_info.append((path, stat.st_size, stat.st_mtime, stat.st_ino))
+                    
+                    if debug:
+                        logger.debug(f"Found file {path} with size {stat.st_size}, mtime {stat.st_mtime}, inode {stat.st_ino}")
+                
+                except (FileNotFoundError, PermissionError) as e:
+                    logger.error(f"File error {path}: {e}")
                 except Exception as e:
                     logger.error(f"Error getting info for file {path}: {e}")
-            
-            # Log progress after processing each directory
-            logger.info(f"Scanned directory: {root}, found {len(files)} files.")
-        logger.info(f"Total files found in {directory}: {total_files}")
+        
         logger.info(f"Total files processed in {directory}: {len(file_info)}")
+    
     except Exception as e:
         logger.error(f"Error scanning directory {directory}: {e}")
+    
     return file_info
 
-# Process files
 def process_files(file_info, verbose, debug, enable_perceptual_hashing):
+    """
+    Process the list of files by hashing and storing their information in the database.
+    
+    Parameters:
+    file_info (list): List of tuples containing file information (path, size, mtime, inode).
+    verbose (bool): Enable verbose logging.
+    debug (bool): Enable debug logging.
+    enable_perceptual_hashing (bool): Enable perceptual hashing for images and videos.
+    """
     logger.info(f"Processing {len(file_info)} files:")
     try:
         conn = sqlite3.connect('file_hashes.db')
         c = conn.cursor()
         processed_count = 0
         commit_count = 0
+        total_files = len(file_info)
         for path, size, mtime, inode in file_info:
             try:
                 process_single_file(path, size, mtime, inode, c, debug, enable_perceptual_hashing)
@@ -254,12 +321,12 @@ def process_files(file_info, verbose, debug, enable_perceptual_hashing):
                 if commit_count >= COMMIT_THRESHOLD:
                     conn.commit()
                     commit_count = 0
-                    logger.info(f"Committed changes after {COMMIT_THRESHOLD} operations")
+                    logger.info(f"Committed changes: {processed_count}/{total_files}")
             except sqlite3.Error as e:
-                logger.error(f"Database error querying file {path}: {e}")
+                logger.error(f"Database error processing file {path}: {e}")
             except Exception as e:
                 logger.error(f"Error processing file {path}: {e}")
-        
+
         if commit_count > 0:
             conn.commit()
             logger.info(f"Final commit for remaining {commit_count} operations.")
@@ -270,12 +337,35 @@ def process_files(file_info, verbose, debug, enable_perceptual_hashing):
         conn.close()
 
 def process_single_file(path, size, mtime, inode, cursor, debug, enable_perceptual_hashing):
+    """
+    Process a single file by hashing and storing its information in the database.
+    
+    Parameters:
+    path (str): Path to the file.
+    size (int): Size of the file.
+    mtime (float): Last modified time of the file.
+    inode (int): Inode number of the file.
+    cursor (sqlite3.Cursor): Database cursor.
+    debug (bool): Enable debug logging.
+    enable_perceptual_hashing (bool): Enable perceptual hashing for images and videos.
+    """
     try:
-        cursor.execute("SELECT mtime, initial_hash FROM files WHERE path=?", (path,))
+        cursor.execute("SELECT mtime, initial_hash, inode, hardlinked FROM files WHERE path=?", (path,))
         result = cursor.fetchone()
         if debug:
             logger.debug(f"{path}: {result}")
+        
         if not result or result[0] != mtime:
+            cursor.execute("SELECT path FROM files WHERE inode=?", (inode,))
+            hardlink_paths = cursor.fetchall()
+            if hardlink_paths:
+                # Mark current file as hardlinked
+                cursor.execute("REPLACE INTO files (path, size, mtime, initial_hash, crc32_hash, sha256_hash, inode, perceptual_hash, video_hash, processed, hardlinked) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                               (path, size, mtime, None, None, None, inode, None, None, True, True))
+                if debug:
+                    logger.debug(f"HARDLINK: {inode}: {path} -> {hardlink_paths}")
+                return  # Skip further processing for hardlinked file
+
             initial_hash = hash_initial_bytes(path, size, debug)
             if initial_hash:
                 insert_or_update_file(path, size, mtime, inode, initial_hash, cursor, debug, enable_perceptual_hashing)
@@ -285,6 +375,19 @@ def process_single_file(path, size, mtime, inode, cursor, debug, enable_perceptu
         logger.error(f"Error processing file {path}: {e}")
 
 def insert_or_update_file(path, size, mtime, inode, initial_hash, cursor, debug, enable_perceptual_hashing):
+    """
+    Insert or update a file's information in the database.
+    
+    Parameters:
+    path (str): Path to the file.
+    size (int): Size of the file.
+    mtime (float): Last modified time of the file.
+    inode (int): Inode number of the file.
+    initial_hash (str): Initial hash of the file.
+    cursor (sqlite3.Cursor): Database cursor.
+    debug (bool): Enable debug logging.
+    enable_perceptual_hashing (bool): Enable perceptual hashing for images and videos.
+    """
     try:
         crc32_hash = None
         sha256_hash = None
@@ -304,23 +407,45 @@ def insert_or_update_file(path, size, mtime, inode, initial_hash, cursor, debug,
         logger.error(f"Database error for file {path}: {e}")
         cursor.connection.rollback()
 
-# Count entries in the table
 def count_entries():
+    """
+    Count the number of entries in the files table.
+    
+    Returns:
+    int: Number of entries in the files table.
+    """
     global main_conn, main_cursor
     main_cursor.execute("SELECT COUNT(*) FROM files")
     count = main_cursor.fetchone()[0]
     logger.info(f"Database contains {count} entries.")
     return count
 
-# Verify database contents
 def verify_database(verbose, debug):
+    """
+    Verify the database contents.
+    
+    Parameters:
+    verbose (bool): Enable verbose logging.
+    debug (bool): Enable debug logging.
+    
+    Returns:
+    int: Number of entries in the files table.
+    """
     if debug:
         count = count_entries()
         logger.debug(f"Database contains {count} entries.")
     return count
 
-# Save duplicates in the database
 def save_duplicates(duplicates, conn, verbose, debug):
+    """
+    Save duplicate file groups in the database.
+    
+    Parameters:
+    duplicates (list): List of duplicate file groups.
+    conn (sqlite3.Connection): Database connection.
+    verbose (bool): Enable verbose logging.
+    debug (bool): Enable debug logging.
+    """
     c = conn.cursor()
     try:
         for duplicate_group in duplicates:
@@ -341,38 +466,30 @@ def save_duplicates(duplicates, conn, verbose, debug):
         logger.error(f"Error saving duplicates: {e}")
         conn.rollback()
 
-# Find duplicates
 def find_duplicates(verbose, debug, enable_perceptual_hashing):
+    """
+    Find duplicate files in the database.
+    
+    Parameters:
+    verbose (bool): Enable verbose logging.
+    debug (bool): Enable debug logging.
+    enable_perceptual_hashing (bool): Enable perceptual hashing for images and videos.
+    
+    Returns:
+    list: List of duplicate file groups.
+    """
     logger.info("Finding duplicates.")
     try:
         conn = sqlite3.connect('file_hashes.db')
-        conn.isolation_level = None  # To handle potential database locking issues
         c = conn.cursor()
-        # Ensure we process any files that were marked as unprocessed before duplicate detection
-        c.execute("SELECT size, initial_hash, GROUP_CONCAT(path, '|||'), GROUP_CONCAT(inode, '|||') FROM files WHERE processed = 0 GROUP BY size, initial_hash HAVING COUNT(*) > 1")
+        c.execute("SELECT size, initial_hash, GROUP_CONCAT(path, '|||'), GROUP_CONCAT(inode, '|||') FROM files WHERE processed = 0 AND hardlinked != 1 GROUP BY size, initial_hash HAVING COUNT(*) > 1")
         potential_duplicates = c.fetchall()
-
         duplicates = []
-        total_files = len(potential_duplicates)
-        logger.info(f"Total potential duplicate groups: {total_files}")
-
-        for i, (size, initial_hash, paths, inodes) in enumerate(potential_duplicates):
-            try:
-                process_duplicate_group(size, initial_hash, paths, inodes, duplicates, conn, c, verbose, debug, enable_perceptual_hashing)
-                logger.info(f"Processed {i + 1} out of {total_files} potential duplicate groups")
-            except sqlite3.OperationalError as e:
-                logger.error(f"Database locking error during processing group {paths}: {e}")
-                continue  # Skip this group and continue with the next
-            except Exception as e:
-                logger.error(f"Error processing potential duplicate group {paths}: {e}")
-
-        # Save duplicates in the database
+        for size, initial_hash, paths, inodes in potential_duplicates:
+            process_duplicate_group(size, initial_hash, paths, inodes, duplicates, conn, c, verbose, debug, enable_perceptual_hashing)
         save_duplicates(duplicates, conn, verbose, debug)
-
-        # Mark all files as processed
         c.execute("UPDATE files SET processed = 1 WHERE processed = 0")
         conn.commit()
-
         logger.info(f"Found {len(duplicates)} duplicate groups.")
     except sqlite3.Error as e:
         logger.error(f"Database error during duplicate finding: {e}")
@@ -383,29 +500,27 @@ def find_duplicates(verbose, debug, enable_perceptual_hashing):
     return duplicates
 
 def process_duplicate_group(size, initial_hash, paths, inodes, duplicates, conn, cursor, verbose, debug, enable_perceptual_hashing):
+    """
+    Process a group of potential duplicate files.
+    
+    Parameters:
+    size (int): Size of the files.
+    initial_hash (str): Initial hash of the files.
+    paths (str): Concatenated file paths.
+    inodes (str): Concatenated inode numbers.
+    duplicates (list): List of duplicate file groups.
+    conn (sqlite3.Connection): Database connection.
+    cursor (sqlite3.Cursor): Database cursor.
+    verbose (bool): Enable verbose logging.
+    debug (bool): Enable debug logging.
+    enable_perceptual_hashing (bool): Enable perceptual hashing for images and videos.
+    """
     files = paths.split('|||')
     inode_list = inodes.split('|||')
     inode_dict = dict(zip(files, inode_list))
     crc32_hash_dict = {}  # Reinitialize for each group
     if verbose or debug:
         logger.debug(f"Processing group: {files}, size: {size}, initial hash: {initial_hash}")
-
-    # Group files by inode first to skip further processing for hardlinked files
-    inode_groups = {}
-    for file in files:
-        inode = inode_dict[file]
-        if inode in inode_groups:
-            inode_groups[inode].append(file)
-        else:
-            inode_groups[inode] = [file]
-
-    # Skip hardlinked files and log them
-    for inode, inode_files in inode_groups.items():
-        if len(inode_files) > 1:
-            if verbose or debug:
-                logger.info(f"Skipping hardlinked files: {inode_files}")
-            cursor.executemany("UPDATE files SET processed = 1 WHERE path = ?", [(f,) for f in inode_files])
-            continue  # Skip further processing for hardlinked files
 
     # Process each unique file for CRC32 and SHA-256 hashing
     for file in files:
@@ -416,11 +531,10 @@ def process_duplicate_group(size, initial_hash, paths, inodes, duplicates, conn,
             else:
                 crc32_hash_dict[crc32_hash] = [file.strip()]
         else:
-            logger.error(f"  Failed to compute CRC32 hash for {file.strip()}")
+            logger.error(f"Failed to compute CRC32 hash for {file.strip()}")
+
     for crc32_hash, crc32_files in crc32_hash_dict.items():
         if len(crc32_files) > 1:
-            if verbose or debug:
-                logger.debug(f"CRC32 Full hash {crc32_hash}...")
             sha256_hash_dict = {}
             for file in crc32_files:
                 sha256_hash = hash_sha256(file.strip(), debug)
@@ -430,18 +544,16 @@ def process_duplicate_group(size, initial_hash, paths, inodes, duplicates, conn,
                     else:
                         sha256_hash_dict[sha256_hash] = [file.strip()]
                 else:
-                    logger.error(f"  Failed to compute SHA-256 hash for {file.strip()}")
+                    logger.error(f"Failed to compute SHA-256 hash for {file.strip()}")
             for sha256_hash, sha256_hash_files in sha256_hash_dict.items():
                 if len(sha256_hash_files) > 1:
                     duplicates.append(sha256_hash_files)
                     if verbose or debug:
                         logger.debug(f"Duplicate group confirmed with SHA-256 hash {sha256_hash}: {sha256_hash_files}")
-                    # Mark duplicates as processed to avoid reprocessing them
                     cursor.executemany("UPDATE files SET processed = 1 WHERE path = ?", [(f,) for f in sha256_hash_files])
                     conn.commit()
                 else:
                     if enable_perceptual_hashing:
-                        # Fuzzy matching
                         file_type = get_file_type(file.strip())
                         if 'image' in file_type:
                             perceptual_hash = hash_perceptual(file.strip(), debug)
@@ -459,33 +571,38 @@ def process_duplicate_group(size, initial_hash, paths, inodes, duplicates, conn,
                                     duplicates.append([file.strip(), other_file.strip()])
                                     if verbose or debug:
                                         logger.info(f"Fuzzy matched video {file.strip()} and {other_file.strip()}")
-                    if verbose or debug:
-                        logger.debug(f"Duplicate group with CRC32 {crc32_hash} is false")
         else:
             if verbose or debug:
                 logger.debug(f"Duplicate group with CRC32 {crc32_hash} is false")
 
-# Generate linking script
 def generate_link_script(duplicates, verbose, debug):
-    print("Generating linking script.")
+    """
+    Generate a script to create hardlinks for duplicate files.
+    
+    Parameters:
+    duplicates (list): List of duplicate file groups.
+    verbose (bool): Enable verbose logging.
+    debug (bool): Enable debug logging.
+    """
+    logger.info("Generating linking script.")
     try:
         with open('link_script.sh', 'w') as f:
             for sha256_hash, paths in duplicates:
                 files = paths.split('|||')
                 if not files:
                     continue
-                
+
                 keep = files[0]
                 keep_inode = os.stat(keep).st_ino
                 keep_fs = os.stat(keep).st_dev
-                
+
                 for file in files[1:]:
                     file_inode = os.stat(file).st_ino
                     if file_inode == keep_inode:
                         if verbose or debug:
-                            print(f"Skipping hardlinked file: {file}")
+                            logger.info(f"Skipping hardlinked file: {file}")
                         continue
-                    
+
                     file_fs = os.stat(file).st_dev
                     escaped_keep = shlex.quote(keep)
                     escaped_file = shlex.quote(file)
@@ -493,14 +610,16 @@ def generate_link_script(duplicates, verbose, debug):
                         f.write(f'ln -f {escaped_keep} {escaped_file}\n')
                     else:
                         f.write(f'ln -sf {escaped_keep} {escaped_file}\n')
-        print(f"Linking script generated with {len(duplicates)} duplicate groups.")
+        logger.info(f"Linking script generated with {len(duplicates)} duplicate groups.")
     except IOError as e:
-        print(f"IO error while generating linking script: {e}")
+        logger.error(f"IO error while generating linking script: {e}")
     except Exception as e:
-        print(f"Error generating linking script: {e}")
+        logger.error(f"Error generating linking script: {e}")
 
-# Function to reset the processed flag
 def reset_processed():
+    """
+    Reset the processed flag for all files in the database.
+    """
     global main_conn, main_cursor
     try:
         logger.info("Resetting processed flag for all files.")
@@ -514,8 +633,14 @@ def reset_processed():
         logger.error(f"Error resetting processed flag: {e}")
         main_conn.rollback()
 
-# Reprocess files that are not marked as duplicates
 def reprocess_unprocessed_files(verbose, debug):
+    """
+    Reprocess files that are not marked as duplicates without re-walking the file system.
+    
+    Parameters:
+    verbose (bool): Enable verbose logging.
+    debug (bool): Enable debug logging.
+    """
     global main_conn, main_cursor
     try:
         logger.info("Reprocessing files that are not marked as duplicates.")
@@ -532,8 +657,10 @@ def reprocess_unprocessed_files(verbose, debug):
         logger.error(f"Error reprocessing unprocessed files: {e}")
         main_conn.rollback()
 
-# Output list of detected duplicates
 def output_duplicates():
+    """
+    Output the list of detected duplicates from the database.
+    """
     try:
         conn = sqlite3.connect('file_hashes.db')
         c = conn.cursor()
@@ -549,37 +676,51 @@ def output_duplicates():
     except Exception as e:
         logger.error(f"Error outputting duplicates: {e}")
 
-# Main function
 def main(directories, verbose, debug, reset, list_duplicates, generate_links, reprocess, enable_perceptual_hashing):
+    """
+    Main function to execute the duplicate finder script.
+    
+    Parameters:
+    directories (list): List of directories to scan.
+    verbose (bool): Enable verbose logging.
+    debug (bool): Enable debug logging.
+    reset (bool): Reset the processed flag for all files.
+    list_duplicates (bool): Output list of detected duplicates.
+    generate_links (bool): Generate link script from detected duplicates.
+    reprocess (bool): Reprocess files that are not marked as duplicates.
+    enable_perceptual_hashing (bool): Enable perceptual hashing for images and videos.
+    """
     global main_conn, main_cursor
     try:
         configure_logging(verbose, debug)
         if list_duplicates:
             output_duplicates()
             return
-
         init_db()
-
         if reset:
             reset_processed()
         elif reprocess:
             reprocess_unprocessed_files(verbose, debug)
-        
         if not generate_links:
             process_directories(directories, verbose, debug, enable_perceptual_hashing)
-            duplicates = load_duplicates_from_db()
+        duplicates = load_duplicates_from_db()
+        if generate_links:
             generate_link_script(duplicates, verbose, debug)
-        else:
-            duplicates = load_duplicates_from_db()
-            generate_link_script(duplicates, verbose, debug)
-
         finalize_database(debug)
     except Exception as e:
         logger.error(f"Unhandled exception: {e}")
     finally:
-        main_conn.close()
+        if main_conn:
+            main_conn.close()
 
 def configure_logging(verbose, debug):
+    """
+    Configure logging settings.
+    
+    Parameters:
+    verbose (bool): Enable verbose logging.
+    debug (bool): Enable debug logging.
+    """
     if debug:
         logger.setLevel(logging.DEBUG)
     elif verbose:
@@ -588,6 +729,15 @@ def configure_logging(verbose, debug):
         logger.setLevel(logging.WARNING)
 
 def process_directories(directories, verbose, debug, enable_perceptual_hashing):
+    """
+    Process the list of directories to find duplicate files.
+    
+    Parameters:
+    directories (list): List of directories to scan.
+    verbose (bool): Enable verbose logging.
+    debug (bool): Enable debug logging.
+    enable_perceptual_hashing (bool): Enable perceptual hashing for images and videos.
+    """
     count_entries()
     with ThreadPoolExecutor() as executor:
         futures = []
@@ -602,6 +752,12 @@ def process_directories(directories, verbose, debug, enable_perceptual_hashing):
     save_duplicates(duplicates, main_conn, verbose, debug)
 
 def load_duplicates_from_db():
+    """
+    Load duplicate file groups from the database.
+    
+    Returns:
+    list: List of duplicate file groups.
+    """
     try:
         conn = sqlite3.connect('file_hashes.db')
         c = conn.cursor()
@@ -617,6 +773,12 @@ def load_duplicates_from_db():
         return []
 
 def finalize_database(debug):
+    """
+    Perform final database operations such as checkpointing and vacuuming.
+    
+    Parameters:
+    debug (bool): Enable debug logging.
+    """
     try:
         main_cursor.execute("PRAGMA wal_checkpoint(FULL)")
         main_cursor.execute("PRAGMA synchronous = FULL")
@@ -628,8 +790,6 @@ def finalize_database(debug):
     if debug:
         logger.debug("Performed PRAGMA wal_checkpoint, synchronous, and VACUUM.")
 
-
-# Example usage
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Find duplicate files and generate linking script.")
     parser.add_argument("directories", nargs='*', help="Directories to scan for duplicate files.")
@@ -652,4 +812,3 @@ if __name__ == "__main__":
         main(args.directories, args.verbose, args.debug, args.reset, args.list_duplicates, args.generate_links, args.reprocess, args.enable_perceptual_hashing)
     except Exception as e:
         logger.error(f"Unhandled exception: {e}")
-
