@@ -232,8 +232,8 @@ def find_duplicates(verbose, debug):
     for i, (size, initial_hash, paths) in enumerate(potential_duplicates):
         files = paths.split(',')
         if verbose or debug:
-            print(f"Possible duplicate found with size {size} and initial hash {initial_hash}: {files}")
-            logging.info(f"Possible duplicate found with size {size} and initial hash {initial_hash}: {files}")
+            print(f"{files}: {size} {initial_hash}...", end="")
+            logging.info(f"{files}: {size} {initial_hash}:")
         for file in files:
             crc32_hash = hash_crc32(file, debug)
             if crc32_hash:
@@ -242,12 +242,12 @@ def find_duplicates(verbose, debug):
                 else:
                     crc32_hash_dict[crc32_hash] = [file]
             else:
-                logging.error(f"Failed to compute CRC32 hash for {file}")
+                logging.error(f"  Failed to compute CRC32 hash for {file}")
         for crc32_hash, crc32_files in crc32_hash_dict.items():
             if len(crc32_files) > 1:
                 if verbose or debug:
-                    print(f"Possible duplicate found with CRC32 hash {crc32_hash}: {crc32_files}")
-                    logging.info(f"Possible duplicate found with CRC32 hash {crc32_hash}: {crc32_files}")
+                    print(f"CRC32 Full hash {crc32_hash}...", end="")
+                    logging.info(f"  CRC32 Full hash {crc32_hash}...")
                 sha256_hash_dict = {}
                 for file in crc32_files:
                     sha256_hash = hash_sha256(file, debug)
@@ -257,16 +257,24 @@ def find_duplicates(verbose, debug):
                         else:
                             sha256_hash_dict[sha256_hash] = [file]
                     else:
-                        logging.error(f"Failed to compute SHA-256 hash for {file}")
-                for sha256_hash_files in sha256_hash_dict.values():
+                        logging.error(f"  Failed to compute SHA-256 hash for {file}")
+                for sha256_hash, sha256_hash_files in sha256_hash_dict.items():
                     if len(sha256_hash_files) > 1:
                         duplicates.append(sha256_hash_files)
                         if verbose or debug:
-                            print(f"Duplicate group confirmed with SHA-256 hash {sha256_hash}: {sha256_hash_files}")
-                            logging.info(f"Duplicate group confirmed with SHA-256 hash {sha256_hash}: {sha256_hash_files}")
+                            print(f"confirmed SHA-256 {sha256_hash}")
+                            logging.info(f"  Duplicate group confirmed with SHA-256 hash {sha256_hash}: {sha256_hash_files}")
                         # Mark duplicates as processed to avoid reprocessing them
                         c.executemany("UPDATE files SET processed = 1 WHERE path = ?", [(f,) for f in sha256_hash_files])
                         conn.commit()
+                    else:
+                        if verbose or debug:
+                            print("no match")
+                            logging.info("Duplicate group with CRC32 {crc32_hash} is false")
+            else:
+                if verbose or debug:
+                    print("no match")
+                    logging.info("  Duplicate group with CRC32 {crc32_hash} is false")
         # Progress reporting
         if verbose:
             print(f"Processed {i + 1} out of {total_files} potential duplicate groups")
@@ -300,11 +308,21 @@ def generate_link_script(duplicates, verbose, debug):
         print(f"Linking script generated with {len(duplicates)} duplicate groups.")
     logging.info(f"Linking script generated with {len(duplicates)} duplicate groups.")
 
+# Function to reset the processed flag
+def reset_processed():
+    global main_conn, main_cursor
+    logging.info("Resetting processed flag for all files.")
+    main_cursor.execute("UPDATE files SET processed = 0")
+    main_conn.commit()
+    logging.info("Processed flag reset.")
+
 # Main function
-def main(directories, verbose, debug):
+def main(directories, verbose, debug, reset):
     if debug:
         logging.debug("Starting main function.")
     init_db()
+    if reset:
+        reset_processed()
     count_entries()
     with ThreadPoolExecutor() as executor:
         futures = []
@@ -336,6 +354,7 @@ if __name__ == "__main__":
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output.")
     parser.add_argument("--debug", action="store_true", help="Enable detailed debug output.")
     parser.add_argument("--min-size", type=int, default=MIN_FILE_SIZE, help="Minimum file size for duplicate detection.")
+    parser.add_argument("--reset", action="store_true", help="Reset the processed flag for all files.")
     args = parser.parse_args()
 
     # Use the provided min size or default to MIN_FILE_SIZE
@@ -344,7 +363,7 @@ if __name__ == "__main__":
     logging.getLogger().setLevel(logging.DEBUG if args.debug else logging.INFO)
 
     try:
-        main(args.directories, args.verbose, args.debug)
+        main(args.directories, args.verbose, args.debug, args.reset)
     except Exception as e:
         logging.error(f"Unhandled exception: {e}")
         print(f"Unhandled exception: {e}")
