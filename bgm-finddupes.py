@@ -216,19 +216,10 @@ def process_files(file_info, verbose, debug):
             logging.debug(f"{path}: {result}")
         if not result or result[0] != mtime:
             initial_hash = hash_initial_bytes(path, size, debug)
-            crc32_hash = hash_crc32(path, debug)
-            sha256_hash = hash_sha256(path, debug)
-            perceptual_hash = None
-            video_hash = None
-            file_type = get_file_type(path)
-            if 'image' in file_type:
-                perceptual_hash = hash_perceptual(path, debug)
-            elif 'video' in file_type:
-                video_hash = hash_video(path, debug)
             if initial_hash:
                 try:
-                    c.execute("REPLACE INTO files (path, size, mtime, initial_hash, crc32_hash, sha256_hash, inode, perceptual_hash, video_hash, processed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                              (path, size, mtime, initial_hash, crc32_hash, sha256_hash, inode, perceptual_hash, video_hash, False))
+                    c.execute("REPLACE INTO files (path, size, mtime, initial_hash, inode, processed) VALUES (?, ?, ?, ?, ?, ?)",
+                              (path, size, mtime, initial_hash, inode, False))
                     if debug:
                         logging.debug(f"Inserted/Updated file {path} with initial hash {initial_hash}")
                     commit_count += 1
@@ -293,26 +284,26 @@ def find_duplicates(verbose, debug):
     conn = sqlite3.connect('file_hashes.db')
     c = conn.cursor()
     # Ensure we process any files that were marked as unprocessed before duplicate detection
-    c.execute("SELECT size, initial_hash, GROUP_CONCAT(path, '|||') FROM files WHERE processed = 0 GROUP BY size, initial_hash HAVING COUNT(*) > 1")
+    c.execute("SELECT size, initial_hash, GROUP_CONCAT(path) FROM files WHERE processed = 0 GROUP BY size, initial_hash HAVING COUNT(*) > 1")
     potential_duplicates = c.fetchall()
 
     duplicates = []
+    crc32_hash_dict = {}
     total_files = len(potential_duplicates)
     for i, (size, initial_hash, paths) in enumerate(potential_duplicates):
-        files = paths.split('|||')
-        crc32_hash_dict = {}  # Reinitialize for each group
+        files = paths.split(',')
         if verbose or debug:
             print(f"{files}: {size} {initial_hash}...", end="")
             logging.info(f"{files}: {size} {initial_hash}:")
         for file in files:
-            crc32_hash = hash_crc32(file.strip(), debug)  # Ensure to strip any extra spaces
+            crc32_hash = hash_crc32(file, debug)
             if crc32_hash:
                 if crc32_hash in crc32_hash_dict:
-                    crc32_hash_dict[crc32_hash].append(file.strip())
+                    crc32_hash_dict[crc32_hash].append(file)
                 else:
-                    crc32_hash_dict[crc32_hash] = [file.strip()]
+                    crc32_hash_dict[crc32_hash] = [file]
             else:
-                logging.error(f"  Failed to compute CRC32 hash for {file.strip()}")
+                logging.error(f"  Failed to compute CRC32 hash for {file}")
         for crc32_hash, crc32_files in crc32_hash_dict.items():
             if len(crc32_files) > 1:
                 if verbose or debug:
@@ -320,14 +311,14 @@ def find_duplicates(verbose, debug):
                     logging.info(f"  CRC32 Full hash {crc32_hash}...")
                 sha256_hash_dict = {}
                 for file in crc32_files:
-                    sha256_hash = hash_sha256(file.strip(), debug)
+                    sha256_hash = hash_sha256(file, debug)
                     if sha256_hash:
                         if sha256_hash in sha256_hash_dict:
-                            sha256_hash_dict[sha256_hash].append(file.strip())
+                            sha256_hash_dict[sha256_hash].append(file)
                         else:
-                            sha256_hash_dict[sha256_hash] = [file.strip()]
+                            sha256_hash_dict[sha256_hash] = [file]
                     else:
-                        logging.error(f"  Failed to compute SHA-256 hash for {file.strip()}")
+                        logging.error(f"  Failed to compute SHA-256 hash for {file}")
                 for sha256_hash, sha256_hash_files in sha256_hash_dict.items():
                     if len(sha256_hash_files) > 1:
                         duplicates.append(sha256_hash_files)
@@ -338,38 +329,17 @@ def find_duplicates(verbose, debug):
                         c.executemany("UPDATE files SET processed = 1 WHERE path = ?", [(f,) for f in sha256_hash_files])
                         conn.commit()
                     else:
-                        # Fuzzy matching
-                        file_type = get_file_type(file.strip())
-                        if 'image' in file_type:
-                            perceptual_hash = hash_perceptual(file.strip(), debug)
-                            for other_file in sha256_hash_files:
-                                other_perceptual_hash = hash_perceptual(other_file.strip(), debug)
-                                if perceptual_hash and other_perceptual_hash and perceptual_hash - other_perceptual_hash <= FUZZY_MATCH_THRESHOLD:
-                                    duplicates.append([file.strip(), other_file.strip()])
-                                    if verbose or debug:
-                                        print(f"fuzzy matched image {file.strip()} and {other_file.strip()}")
-                                        logging.info(f"  Fuzzy matched image {file.strip()} and {other_file.strip()}")
-                        elif 'video' in file_type:
-                            video_hash = hash_video(file.strip(), debug)
-                            for other_file in sha256_hash_files:
-                                other_video_hash = hash_video(other_file.strip(), debug)
-                                if video_hash and other_video_hash and video_hash == other_video_hash:
-                                    duplicates.append([file.strip(), other_file.strip()])
-                                    if verbose or debug:
-                                        print(f"fuzzy matched video {file.strip()} and {other_file.strip()}")
-                                        logging.info(f"  Fuzzy matched video {file.strip()} and {other_file.strip()}")
-                        if verbose or debug:
-                            print("no match")
-                            logging.info(f"Duplicate group with CRC32 {crc32_hash} is false")
-            else:
-                if verbose or debug:
-                    print("no match")
-                    logging.info(f"  Duplicate group with CRC32 {crc32_hash} is false")
-        # Progress reporting
-        if verbose:
-            print(f"Processed {i + 1} out of {total_files} potential duplicate groups")
-        logging.info(f"Processed {i + 1} out of {total_files} potential duplicate groups")
-
+                        file_type = get_file_type(file)
+                        if "image" in file_type:
+                            perceptual_hash = hash_perceptual(file, debug)
+                            if perceptual_hash:
+                                c.execute("UPDATE files SET perceptual_hash = ? WHERE path = ?", (perceptual_hash, file))
+                                conn.commit()
+                        elif "video" in file_type:
+                            video_hash = hash_video(file, debug)
+                            if video_hash:
+                                c.execute("UPDATE files SET video_hash = ? WHERE path = ?", (video_hash, file))
+                                conn.commit()
     # Save duplicates in the database
     save_duplicates(duplicates, conn, verbose, debug)
 
@@ -391,9 +361,9 @@ def generate_link_script(duplicates, verbose, debug):
             keep = files[0]
             for file in files[1:]:
                 if os.path.samefile(os.path.dirname(keep), os.path.dirname(file)):
-                    f.write(f"ln -f \"{keep}\" \"{file}\"\n")
+                    f.write(f'ln -f "{keep}" "{file}"\n')
                 else:
-                    f.write(f"ln -sf \"{keep}\" \"{file}\"\n")
+                    f.write(f'ln -sf "{keep}" "{file}"\n')
     if verbose:
         print(f"Linking script generated with {len(duplicates)} duplicate groups.")
     logging.info(f"Linking script generated with {len(duplicates)} duplicate groups.")
@@ -406,54 +376,30 @@ def reset_processed():
     main_conn.commit()
     logging.info("Processed flag reset.")
 
-# Output list of detected duplicates
-def output_duplicates():
-    conn = sqlite3.connect('file_hashes.db')
-    c = conn.cursor()
-    c.execute("SELECT sha256_hash, paths FROM duplicates")
-    duplicates = c.fetchall()
-    for sha256_hash, paths in duplicates:
-        print(f"SHA-256: {sha256_hash}")
-        print(f"Paths: {paths}")
-        print("="*40)
-    conn.close()
-
 # Main function
-def main(directories, verbose, debug, reset, list_duplicates, generate_links):
-    global main_conn, main_cursor
+def main(directories, verbose, debug, reset):
     if debug:
         logging.debug("Starting main function.")
-    if list_duplicates:
-        output_duplicates()
-        return
     init_db()
     if reset:
         reset_processed()
-    if not generate_links:
-        count_entries()
-        with ThreadPoolExecutor() as executor:
-            futures = []
-            for directory in directories:
-                file_info = scan_directory(directory, verbose, debug)
-                futures.append(executor.submit(process_files, file_info, verbose, debug))
-            for future in futures:
-                future.result()
-        if debug:
-            verify_database(verbose, debug)
-        duplicates = find_duplicates(verbose, debug)
-        save_duplicates(duplicates, main_conn, verbose, debug)
-    else:
-        duplicates = []
-        conn = sqlite3.connect('file_hashes.db')
-        c = conn.cursor()
-        c.execute("SELECT sha256_hash, paths FROM duplicates")
-        duplicates = c.fetchall()
-        conn.close()
+    count_entries()
+    with ThreadPoolExecutor() as executor:
+        futures = []
+        for directory in directories:
+            file_info = scan_directory(directory, verbose, debug)
+            futures.append(executor.submit(process_files, file_info, verbose, debug))
+        for future in futures:
+            future.result()
+    if debug:
+        verify_database(verbose, debug)
+    duplicates = find_duplicates(verbose, debug)
     generate_link_script(duplicates, verbose, debug)
     if debug:
         logging.debug("Completed main function.")
 
     # Force disk sync and perform VACUUM
+    global main_conn, main_cursor
     main_cursor.execute("PRAGMA wal_checkpoint(FULL)")
     main_cursor.execute("PRAGMA synchronous = FULL")
     main_cursor.execute("VACUUM")
@@ -464,13 +410,14 @@ def main(directories, verbose, debug, reset, list_duplicates, generate_links):
 # Example usage
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Find duplicate files and generate linking script.")
-    parser.add_argument("directories", nargs='*', help="Directories to scan for duplicate files.")
+    parser.add_argument("--directories", nargs='+', help="Directories to scan for duplicate files.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output.")
     parser.add_argument("--debug", action="store_true", help="Enable detailed debug output.")
     parser.add_argument("--min-size", type=int, default=MIN_FILE_SIZE, help="Minimum file size for duplicate detection.")
     parser.add_argument("--reset", action="store_true", help="Reset the processed flag for all files.")
-    parser.add_argument("--list-duplicates", action="store_true", help="Output list of detected duplicates.")
+    parser.add_argument("--list-duplicates", action="store_true", help="List detected duplicates from the database.")
     parser.add_argument("--generate-links", action="store_true", help="Generate link script from detected duplicates.")
+
     args = parser.parse_args()
 
     # Use the provided min size or default to MIN_FILE_SIZE
@@ -478,8 +425,26 @@ if __name__ == "__main__":
 
     logging.getLogger().setLevel(logging.DEBUG if args.debug else logging.INFO)
 
-    try:
-        main(args.directories, args.verbose, args.debug, args.reset, args.list_duplicates, args.generate_links)
-    except Exception as e:
-        logging.error(f"Unhandled exception: {e}")
-        print(f"Unhandled exception: {e}")
+    if args.list_duplicates:
+        main_conn = sqlite3.connect('file_hashes.db')
+        main_cursor = main_conn.cursor()
+        main_cursor.execute("SELECT * FROM duplicates")
+        duplicates = main_cursor.fetchall()
+        if args.verbose:
+            for duplicate in duplicates:
+                print(duplicate)
+        else:
+            print(f"Found {len(duplicates)} duplicate groups.")
+        main_conn.close()
+    elif args.generate_links:
+        main_conn = sqlite3.connect('file_hashes.db')
+        main_cursor = main_conn.cursor()
+        main_cursor.execute("SELECT paths FROM duplicates")
+        duplicates = [row[0].split(',') for row in main_cursor.fetchall()]
+        generate_link_script(duplicates, args.verbose, args.debug)
+    else:
+        try:
+            main(args.directories, args.verbose, args.debug, args.reset)
+        except Exception as e:
+            logging.error(f"Unhandled exception: {e}")
+            print(f"Unhandled exception: {e}")
