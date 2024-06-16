@@ -289,7 +289,7 @@ def process_single_file(path, size, mtime, inode, c):
             #### Understand why this 'if' is here, and what the consequence will be if it fails ###############
             ###################################################################################################
             if md5_hash:
-                insert_or_update_file(path, size, mtime, inode, initial_hash, c)
+                insert_or_update_file(path, size, mtime, inode, md5_hash, c)
         elif not debug:
             log(f"{path} exists in DB", 'verbose')
             
@@ -312,7 +312,7 @@ def insert_or_update_file(path, size, mtime, inode, md5_hash, c):
     """
     try:
         execute_with_retry(c, "REPLACE INTO files (path, size, mtime, md5_hash, inode, processed, hardlinked) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                       (path, size, mtime, initial_hash, inode, False, False))
+                       (path, size, mtime, md5_hash, inode, False, False))
         log(f"{path}: {md5_hash} inserted/updated", 'debug')
     except sqlite3.Error as e:
         logger.error(f"Database error for file {path}: {e}")
