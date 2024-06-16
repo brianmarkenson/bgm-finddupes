@@ -11,6 +11,7 @@ from logging.handlers import RotatingFileHandler
 import sys
 import argparse
 import signal
+import mimetypes
 
 # Initialize logging
 logger = logging.getLogger(__name__)
@@ -421,49 +422,81 @@ def output_manual_check_duplicates():
     except Exception as e:
         logger.error(f"Error outputting possible duplicates: {e}")
 
+def is_video_file(path):
+    """
+    Check if the given file is a video file based on its MIME type.
+
+    Parameters:
+    path (str): The path to the file.
+
+    Returns:
+    bool: True if the file is a video file, False otherwise.
+    """
+    mime_type, _ = mimetypes.guess_type(path)
+    return mime_type is not None and mime_type.startswith('video')
+
 def process_duplicate_group(size, md5_hashes, paths, inodes, duplicates, manual_check_duplicates, conn, c):
     """
     Process a group of potential duplicate files.
 
     Parameters:
     size (int): Size of the files.
-    md5_hashes (str): Initial hash of the files.
-    paths (str): Concatenated file paths.
-    inodes (str): Concatenated inode numbers.
+    md5_hashes (list): List of hashes of the files.
+    paths (list): List of file paths.
+    inodes (list): List of inode numbers.
     duplicates (list): List of duplicate file groups.
     manual_check_duplicates (list): List of manual check duplicate file groups.
     conn (sqlite3.Connection): Database connection.
     c (sqlite3.Cursor): Database cursor.
     """
-    files = paths.split('|||')  # Split the concatenated file paths by '|||'
-    sorted_paths = sort_paths("|||".join(files))  # Sort the paths
+    log(f"Processing group: {paths}, size: {size}, md5 hashes: {md5_hashes}", 'both')
 
-    log(f"Processing group: {files}, size: {size}, md5 hashes: {md5_hashes}", 'both')
-
-    all_files_in_group = set(files)
+    all_files_in_group = set(paths)
     confirmed_duplicates = set()
+    files_needing_verification = set()
+    hash_to_files = {}
 
-    if len(md5_hashes) == 1:
-        duplicates.append(files.strio())
-        confirmed_duplicates.update(files)
-        log(f"Duplicate group confirmed with md5 hash {md5_hashes}: {files}", 'both')
-                c.executemany("UPDATE files SET processed = 1 WHERE path = ?", [(f,) for f in files])
+    # Group files by their hashes
+    for file, md5_hash in zip(paths, md5_hashes):
+        if md5_hash not in hash_to_files:
+            hash_to_files[md5_hash] = []
+        hash_to_files[md5_hash].append(file)
+
+    # Process files with the same hash
+    for md5_hash, files in hash_to_files.items():
+        if len(files) > 1:
+            duplicates.append(files)
+            confirmed_duplicates.update(files)
+            log(f"Duplicate group confirmed with md5 hash {md5_hash}: {files}", 'both')
+            c.executemany("UPDATE files SET processed = 1 WHERE path = ?", [(f,) for f in files])
+            conn.commit()
+
+    # Process files with differing hashes
+    for md5_hash, files in hash_to_files.items():
+        if len(files) == 1:
+            file = files[0]
+            if is_video_file(file):
+                files_needing_verification.add(file)
+            else:
+                log(f"Non-video file with differing hash found, not considering as duplicate: {file}", 'both')
+                c.execute("UPDATE files SET processed = 1 WHERE path = ?", (file,))
                 conn.commit()
-        files_needing_verification = set()
-    else:
-        # Files need manual verification if md5_hashes differ
-        files_needing_verification = all_files_in_group
 
+    # Ensure at least one confirmed duplicate is included for manual verification comparison
     if files_needing_verification:
-        execute_with_retry(c, "INSERT INTO manual_check_duplicates (paths) VALUES (?)",
-                       ("|||".join(files_needing_verification),))
+        # Find a confirmed duplicate to add to the manual verification group
+        if confirmed_duplicates:
+            reference_file = next(iter(confirmed_duplicates))
+            files_needing_verification.add(reference_file)
+
+        execute_with_retry(c, "INSERT INTO manual_check_duplicates (paths) VALUES (?)", ("|||".join(files_needing_verification),))
         log(f"Manual check duplicate group: {list(files_needing_verification)}", 'both')
 
         group_id = c.lastrowid
         c.executemany("UPDATE files SET group_id = ? WHERE path = ?", [(group_id, f) for f in files_needing_verification])
         conn.commit()
 
-    log(f"Processing group: {files}, size: {size}, md5 hashes: {md5_hashes}", 'both')
+    log(f"Finished processing group: {paths}, size: {size}, md5 hashes: {md5_hashes}", 'both')
 
 def sort_paths(paths):
     """
@@ -496,30 +529,44 @@ def verify_manual_check_duplicates():
                     size, mtime = file_info
                     mtime_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(mtime))
                     print(f"Path: {file}\nSize: {size} bytes\nLast Modified: {mtime_str}\n")
-            
+
             user_input = input("Are these files duplicates? (y/n): ").strip().lower()
             if user_input == 'y':
                 duplicates = [file.strip() for file in files]
                 log(f"Manually confirmed duplicate group: {duplicates}", 'both')
-                
-                # Check if the group already exists in the duplicates table
-                execute_with_retry(c, "SELECT group_id FROM duplicates WHERE paths = ?", ("|||".join(duplicates),))
-                result = c.fetchone()
-                if result is None:
-                    # Save duplicates to the duplicates table
-                    execute_with_retry(c, "INSERT INTO duplicates (paths) VALUES (?)",
-                              ("|||".join(duplicates),))
+
+                # Check if any of the files already exist in the duplicates table
+                existing_group_id = None
+                for file in duplicates:
+                    execute_with_retry(c, "SELECT group_id FROM duplicates WHERE instr(paths, ?) > 0", (file,))
+                    result = c.fetchone()
+                    if result:
+                        existing_group_id = result[0]
+                        break
+
+                if existing_group_id:
+                    # Update the existing group with new duplicates
+                    execute_with_retry(c, "SELECT paths FROM duplicates WHERE group_id = ?", (existing_group_id,))
+                    existing_paths = c.fetchone()[0]
+                    updated_paths_set = set(existing_paths.split("|||") + duplicates)
+                    updated_paths = "|||".join(updated_paths_set)
+                    execute_with_retry(c, "UPDATE duplicates SET paths = ? WHERE group_id = ?", (updated_paths, existing_group_id))
+                    duplicate_group_id = existing_group_id
+                else:
+                    # Save new group of duplicates to the duplicates table
+                    execute_with_retry(c, "INSERT INTO duplicates (paths) VALUES (?)", ("|||".join(set(duplicates)),))
                     duplicate_group_id = c.lastrowid
 
-                    # Update the files table
-                    c.executemany("UPDATE files SET processed = 1, group_id = ? WHERE path = ?", 
-                                  [(duplicate_group_id, f) for f in duplicates])
+                # Update the files table
+                c.executemany("UPDATE files SET processed = 1, group_id = ? WHERE path = ?", [(duplicate_group_id, f) for f in duplicates])
 
                 # Commit the changes immediately
                 conn.commit()
-
             else:
                 print(f"Group {group_id} marked as not duplicates.")
+                # Update the files table to mark these files as processed without a group ID
+                c.executemany("UPDATE files SET processed = 1 WHERE path = ?", [(f,) for f in files])
+                conn.commit()
 
             # Remove the group from manual_check_duplicates after verification
             execute_with_retry(c, "DELETE FROM manual_check_duplicates WHERE group_id = ?", (group_id,))
