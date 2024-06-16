@@ -12,15 +12,6 @@ import sys
 import argparse
 import signal
 
-# For perceptual hashing (image and video)
-from PIL import Image
-import imagehash
-import magic
-import cv2
-import numpy as np
-from scenedetect import VideoManager, SceneManager
-from scenedetect.detectors import ContentDetector
-
 # Initialize logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -44,14 +35,11 @@ rotating_file_handler.doRollover()
 
 # Constants
 COMMIT_THRESHOLD = 100  # Threshold for database commits
-INITIAL_HASH_SIZE = 1024 * 1024  # Initial hash size: 1 MB
 MIN_FILE_SIZE = 1024  # Minimum file size: 1 KB
-FUZZY_MATCH_THRESHOLD = 5  # Maximum allowed Hamming distance for fuzzy match
 
 # Global flags for use in multiple functions without having to pass them around
 verbose = False
 debug = False
-enable_perceptual_hashing = False
 
 # Global database connection and cursor
 main_conn = None
@@ -102,18 +90,15 @@ def init_db():
             path TEXT PRIMARY KEY,
             size INTEGER,
             mtime REAL,
-            initial_hash TEXT,
-            sha256_hash TEXT,
+            md5_hash TEXT,
             inode INTEGER,
-            perceptual_hash TEXT,
-            video_hash TEXT,
             processed BOOLEAN,
             hardlinked BOOLEAN DEFAULT 0,
             group_id INTEGER
         )''')
         main_cursor.execute('''CREATE TABLE IF NOT EXISTS duplicates (
             group_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sha256_hash TEXT,
+            md5_hash TEXT,
             paths TEXT
         )''')
         main_cursor.execute('''CREATE TABLE IF NOT EXISTS manual_check_duplicates (
@@ -156,127 +141,31 @@ def execute_with_retry(c, query, params=(), retries=5, delay=1):
             else:
                 raise
 
-def hash_initial_bytes(path, size):
+def calculate_md5_middle_dynamic(path, size):
     """
-    Hash the first x bytes of a file using CRC32 for faster hashing.
-    
+    Calculate MD5 hash of a dynamically sized middle subset of a file.
+
     Parameters:
     path (str): Path to the file.
     size (int): Size of the file.
-    
-    Returns:
-    str: Initial hash as a hexadecimal string.
     """
-    crc32 = 0
-    try:
-        with open(path, 'rb') as f:
-            chunk = f.read(min(size, INITIAL_HASH_SIZE))
-            crc32 = zlib.crc32(chunk)
-        initial_hash = f"{crc32 & 0xFFFFFFFF:08x}"
-	#log(f"Initial hash for {path}: {initial_hash}", 'debug')
-        return initial_hash
+
+    # Calculate subset size as 1% of the file size, with a minimum of 1MB and a maximum of 10MB
+    subset_size = min(max(size // 100, 1024 * 1024), 10 * 1024 * 1024)
+    middle_start = (size // 2) - (subset_size // 2)
+    hash_md5 = hashlib.md5()
+    try: 
+        with open(path, "rb") as f:
+            f.seek(middle_start)
+            chunk = f.read(subset_size)
+            hash_md5.update(chunk)
+        return hash_md5.hexdigest()
     except FileNotFoundError:
         logger.error(f"File not found: {path}")
     except PermissionError:
         logger.error(f"Permission denied: {path}")
     except Exception as e:
-        logger.error(f"Error hashing initial bytes of file {path}: {e}")
-    return None
-
-def hash_sha256(path):
-    """
-    Hash the entire file using SHA-256 for robust verification.
-    
-    Parameters:
-    path (str): Path to the file.
-    
-    Returns:
-    str: SHA-256 hash as a hexadecimal string.
-    """
-    sha256 = hashlib.sha256()
-    try:
-        with open(path, 'rb') as f:
-            for chunk in iter(lambda: f.read(65536), b''):
-                sha256.update(chunk)
-        sha256_hash = sha256.hexdigest()
-        log(f"SHA-256 hash for {path}: {sha256_hash}", 'debug')
-        return sha256_hash
-    except FileNotFoundError:
-        logger.error(f"File not found: {path}")
-    except PermissionError:
-        logger.error(f"Permission denied: {path}")
-    except Exception as e:
-        logger.error(f"Error hashing file {path} with SHA-256: {e}")
-    return None
-
-def hash_perceptual(path):
-    """
-    Generate a perceptual hash for image files.
-    
-    Parameters:
-    path (str): Path to the image file.
-    
-    Returns:
-    str: Perceptual hash as a hexadecimal string.
-    """
-    try:
-        image = Image.open(path)
-        perceptual_hash = str(imagehash.phash(image))
-        log(f"Perceptual hash for {path}: {perceptual_hash}", 'debug')
-        return perceptual_hash
-    except FileNotFoundError:
-        logger.error(f"File not found: {path}")
-    except PermissionError:
-        logger.error(f"Permission denied: {path}")
-    except IOError as e:
-        logger.error(f"IO error generating perceptual hash for {path}: {e}")
-    except Exception as e:
-        logger.error(f"Error generating perceptual hash for {path}: {e}")
-    return None
-
-def hash_video(path, frame_intervals=[150, 300, 450]):
-    """
-    Generate a perceptual hash for video files by analyzing frames at specified intervals.
-    
-    Parameters:
-    path (str): Path to the video file.
-    frame_intervals (list): List of frame intervals (in seconds) to analyze.
-    
-    Returns:
-    str: Combined perceptual hash of the analyzed frames.
-    """
-    try:
-        cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
-            logger.error(f"Error opening video file: {path}")
-            return None
-
-        video_hashes = []
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
-
-        for interval in frame_intervals:
-            frame_interval = int(fps * (interval / 30))  # Convert to frame numbers assuming 30fps
-            for frame_num in range(0, frame_count, frame_interval):
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-                ret, frame = cap.read()
-                if ret:
-                    img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                    frame_hash = str(imagehash.phash(img))
-                    video_hashes.append(frame_hash)
-
-        cap.release()
-        combined_hash = ''.join(video_hashes)
-        log(f"Video hash for {path}: {combined_hash}", 'debug')
-        return combined_hash
-    except FileNotFoundError:
-        logger.error(f"File not found: {path}")
-    except PermissionError:
-        logger.error(f"Permission denied: {path}")
-    except cv2.error as e:
-        logger.error(f"OpenCV error generating video hash for {path}: {e}")
-    except Exception as e:
-        logger.error(f"Error generating video hash for {path}: {e}")
+        logger.error(f"Error hashing {subset_size} bytes of file {path}: {e}")
     return None
 
 def scan_directory(directory):
@@ -374,23 +263,32 @@ def process_single_file(path, size, mtime, inode, c):
     c (sqlite3.Cursor): Database cursor.
     """
     try:
-        execute_with_retry(c, "SELECT mtime, initial_hash, inode, hardlinked FROM files WHERE path=?", (path,))
+        execute_with_retry(c, "SELECT mtime, md5_hash, inode, hardlinked FROM files WHERE path=?", (path,))
         result = c.fetchone()
-        # Check to see if file already exists in the database
         log(f"{path}: {result}", 'debug')
-        
+
+        # Check to see if file already exists in the database
         if not result or result[0] != mtime:
             execute_with_retry(c, "SELECT path FROM files WHERE inode=?", (inode,))
             hardlink_paths = c.fetchall()
             if hardlink_paths:
                 # Mark current file as hardlinked
-                execute_with_retry(c, "REPLACE INTO files (path, size, mtime, initial_hash, sha256_hash, inode, perceptual_hash, video_hash, processed, hardlinked) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (path, size, mtime, None, None, inode, None, None, True, True))
+
+
+                ####################################################################################################################################################
+                ################  Need to also mark the other files that are hardlinked as hardlinked if they're not already #######################################
+                ####################################################################################################################################################
+                execute_with_retry(c, "REPLACE INTO files (path, size, mtime, md5_hash, inode, processed, hardlinked) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (path, size, mtime, None, inode, True, True))
                 log(f"HARDLINK: {inode}: {path} -> {hardlink_paths}", 'both')
                 return  # Skip further processing for hardlinked file
 
-            initial_hash = hash_initial_bytes(path, size)
-            if initial_hash:
+            md5_hash = calculate_md5_middle_dynamic(path, size)
+
+	    ###################################################################################################
+            #### Understand why this 'if' is here, and what the consequence will be if it fails ###############
+            ###################################################################################################
+            if md5_hash:
                 insert_or_update_file(path, size, mtime, inode, initial_hash, c)
         elif not debug:
             log(f"{path} exists in DB", 'verbose')
@@ -400,7 +298,7 @@ def process_single_file(path, size, mtime, inode, c):
     except Exception as e:
         logger.error(f"Error processing file {path}: {e}")
 
-def insert_or_update_file(path, size, mtime, inode, initial_hash, c):
+def insert_or_update_file(path, size, mtime, inode, md5_hash, c):
     """
     Insert or update a file's information in the database.
     
@@ -409,22 +307,13 @@ def insert_or_update_file(path, size, mtime, inode, initial_hash, c):
     size (int): Size of the file.
     mtime (float): Last modified time of the file.
     inode (int): Inode number of the file.
-    initial_hash (str): Initial hash of the file.
+    md5_hash (str): Initial hash of the file.
     c (sqlite3.Cursor): Database cursor
     """
     try:
-        sha256_hash = None
-        perceptual_hash = None
-        video_hash = None
-        if enable_perceptual_hashing:
-            file_type = get_file_type(path)
-            if 'image' in file_type:
-                perceptual_hash = hash_perceptual(path)
-            elif 'video' in file_type:
-                video_hash = hash_video(path)
-        execute_with_retry(c, "REPLACE INTO files (path, size, mtime, initial_hash, sha256_hash, inode, perceptual_hash, video_hash, processed, hardlinked) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                       (path, size, mtime, initial_hash, sha256_hash, inode, perceptual_hash, video_hash, False, False))
-        log(f"Inserted/Updated file {path} with initial hash {initial_hash}", 'debug')
+        execute_with_retry(c, "REPLACE INTO files (path, size, mtime, md5_hash, inode, processed, hardlinked) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                       (path, size, mtime, initial_hash, inode, False, False))
+        log(f"{path}: {md5_hash} inserted/updated", 'debug')
     except sqlite3.Error as e:
         logger.error(f"Database error for file {path}: {e}")
         c.connection.rollback()
@@ -464,11 +353,11 @@ def save_duplicates(duplicates, conn):
     c = conn.cursor()
     try:
         for duplicate_group in duplicates:
-            sha256_hash = duplicate_group[0]  # Assuming the first entry's hash represents the group
+            md5_hash = duplicate_group[0]  # Assuming the first entry's hash represents the group
             paths = "|||".join(duplicate_group)
             try:
-                execute_with_retry(c, "INSERT INTO duplicates (sha256_hash, paths) VALUES (?, ?)", (sha256_hash, paths))
-                log(f"Saved duplicate group with SHA-256 hash {sha256_hash}: {paths}", 'debug')
+                execute_with_retry(c, "INSERT INTO duplicates (md5_hash, paths) VALUES (?, ?)", (md5_hash, paths))
+                log(f"DUPLICATES FOUND: {paths}: {md5_hash}", 'debug')
             except sqlite3.Error as e:
                 logger.error(f"Error saving duplicate group {paths}: {e}")
         conn.commit()
@@ -490,14 +379,17 @@ def find_duplicates():
     logger.info("Finding duplicates.")
     try:
         conn, c = create_db_connection()
-        execute_with_retry(c, "SELECT size, initial_hash, GROUP_CONCAT(path, '|||'), GROUP_CONCAT(inode, '|||') FROM files WHERE processed = 0 AND hardlinked != 1 GROUP BY size, initial_hash HAVING COUNT(*) > 1")
+        execute_with_retry(c, "SELECT size, GROUP_CONCAT(md5_hash, '|||'), GROUP_CONCAT(path, '|||'), GROUP_CONCAT(inode, '|||') FROM files WHERE processed = 0 AND hardlinked != 1 GROUP BY size HAVING COUNT(*) > 1")
         potential_duplicates = c.fetchall()
         total_groups = len(potential_duplicates)  # Determine the total number of groups
         duplicates = []
+        #####################################################################################################################################################################################################
+        ##############################################  Update manual check to first check other portions of the file (last 10MB, first 10MB) before putting into manual verification #######################
+        #####################################################################################################################################################################################################
         manual_check_duplicates = []
-        for group_num, (size, initial_hash, paths, inodes) in enumerate(potential_duplicates, start=1):
+        for group_num, (size, md5_hashes, paths, inodes) in enumerate(potential_duplicates, start=1):
             log(f"Processing group {group_num}/{total_groups}", 'both')
-            process_duplicate_group(size, initial_hash, paths, inodes, duplicates, manual_check_duplicates, conn, c)
+            process_duplicate_group(size, md5_hashes, paths, inodes, duplicates, manual_check_duplicates, conn, c)
         save_duplicates(duplicates, conn)
         execute_with_retry(c, "UPDATE files SET processed = 1 WHERE processed = 0")
         conn.commit()
@@ -529,13 +421,13 @@ def output_manual_check_duplicates():
     except Exception as e:
         logger.error(f"Error outputting possible duplicates: {e}")
 
-def process_duplicate_group(size, initial_hash, paths, inodes, duplicates, manual_check_duplicates, conn, c):
+def process_duplicate_group(size, md5_hashes, paths, inodes, duplicates, manual_check_duplicates, conn, c):
     """
     Process a group of potential duplicate files.
 
     Parameters:
     size (int): Size of the files.
-    initial_hash (str): Initial hash of the files.
+    md5_hashes (str): Initial hash of the files.
     paths (str): Concatenated file paths.
     inodes (str): Concatenated inode numbers.
     duplicates (list): List of duplicate file groups.
@@ -546,43 +438,20 @@ def process_duplicate_group(size, initial_hash, paths, inodes, duplicates, manua
     files = paths.split('|||')  # Split the concatenated file paths by '|||'
     sorted_paths = sort_paths("|||".join(files))  # Sort the paths
 
-    log(f"Processing group: {files}, size: {size}, initial hash: {initial_hash}", 'both')
-
-    # Check if the group already exists in the manual_check_duplicates table
-    execute_with_retry(c, "SELECT group_id FROM manual_check_duplicates WHERE paths = ?", (sorted_paths,))
-    result = c.fetchone()
-    if result is not None:
-        log(f"Group with paths {sorted_paths} already exists in manual_check_duplicates.", 'both')
-        return
-
-    sha256_hash_dict = {}
-    for file in files:
-        sha256_hash = hash_sha256(file.strip())
-        if sha256_hash:
-            if sha256_hash in sha256_hash_dict:
-                sha256_hash_dict[sha256_hash].append(file.strip())
-            else:
-                sha256_hash_dict[sha256_hash] = [file.strip()]
-        else:
-            logger.error(f"Failed to compute SHA-256 hash for {file.strip()}")
-
-    log(f"SHA-256 hash groups: {sha256_hash_dict}", 'debug')
+    log(f"Processing group: {files}, size: {size}, md5 hashes: {md5_hashes}", 'both')
 
     all_files_in_group = set(files)
     confirmed_duplicates = set()
 
-    # If SHA-256 hashes are identical, mark as duplicates
-    if len(sha256_hash_dict) == 1:
-        for sha256_hash, sha256_hash_files in sha256_hash_dict.items():
-            if len(sha256_hash_files) > 1:
-                duplicates.append(sha256_hash_files)
-                confirmed_duplicates.update(sha256_hash_files)
-                log(f"Duplicate group confirmed with SHA-256 hash {sha256_hash}: {sha256_hash_files}", 'both')
-                c.executemany("UPDATE files SET processed = 1 WHERE path = ?", [(f,) for f in sha256_hash_files])
+    if len(md5_hashes) == 1:
+        duplicates.append(files.strio())
+        confirmed_duplicates.update(files)
+        log(f"Duplicate group confirmed with md5 hash {md5_hashes}: {files}", 'both')
+                c.executemany("UPDATE files SET processed = 1 WHERE path = ?", [(f,) for f in files])
                 conn.commit()
         files_needing_verification = set()
     else:
-        # Files need manual verification if SHA-256 hashes differ
+        # Files need manual verification if md5_hashes differ
         files_needing_verification = all_files_in_group
 
     if files_needing_verification:
@@ -594,7 +463,7 @@ def process_duplicate_group(size, initial_hash, paths, inodes, duplicates, manua
         c.executemany("UPDATE files SET group_id = ? WHERE path = ?", [(group_id, f) for f in files_needing_verification])
         conn.commit()
 
-    log(f"Processing group: {files}, size: {size}, initial hash: {initial_hash}", 'both')
+    log(f"Processing group: {files}, size: {size}, md5 hashes: {md5_hashes}", 'both')
 
 def sort_paths(paths):
     """
@@ -603,54 +472,6 @@ def sort_paths(paths):
     path_list = paths.split('|||')
     path_list.sort()
     return '|||'.join(path_list)
-
-def mark_verified_duplicates():
-    """
-    Mark manually verified duplicates as duplicates in the database.
-    """
-    try:
-        conn, c = create_db_connection()
-        with open('manual_verification.txt', 'r') as f:
-            verified_groups = f.read().split("="*40 + "\n")
-        
-        for group in verified_groups:
-            lines = group.strip().split("\n")
-            if not lines:
-                continue
-            
-            group_id_line = lines[0]
-            if not group_id_line.startswith("Possible duplicate group"):
-                continue
-            
-            group_id = int(group_id_line.split()[3].strip(':'))
-            files = lines[1:]  # Skip the "Possible duplicate group:" line
-            
-            sha256_hash_dict = {}
-            for file in files:
-                sha256_hash = hash_sha256(file.strip())
-                if sha256_hash:
-                    if sha256_hash in sha256_hash_dict:
-                        sha256_hash_dict[sha256_hash].append(file.strip())
-                    else:
-                        sha256_hash_dict[sha256_hash] = [file.strip()]
-            
-            duplicates = []
-            for sha256_hash, sha256_hash_files in sha256_hash_dict.items():
-                if len(sha256_hash_files) > 1:
-                    duplicates.append(sha256_hash_files)
-                    c.executemany("UPDATE files SET processed = 1 WHERE path = ?", [(f,) for f in sha256_hash_files])
-            
-            # Remove the group from manual_check_duplicates
-            execute_with_retry(c, "DELETE FROM manual_check_duplicates WHERE group_id = ?", (group_id,))
-        
-        save_duplicates(duplicates, conn)
-        conn.commit()
-    except sqlite3.Error as e:
-        logger.error(f"Database error during manual verification: {e}")
-    except Exception as e:
-        logger.error(f"Error in mark_verified_duplicates: {e}")
-    finally:
-        conn.close()
 
 def verify_manual_check_duplicates():
     """
@@ -852,7 +673,7 @@ def output_duplicates():
     except Exception as e:
         logger.error(f"Error outputting duplicates: {e}")
 
-def main(directories, verbose_flag, debug_flag, reset, list_duplicates, generate_links, reprocess, manual_verification, enable_perceptual_hashing_flag, cleanup_flag):
+def main(directories, verbose_flag, debug_flag, reset, list_duplicates, generate_links, reprocess, manual_verification, cleanup_flag):
     """
     Main function to execute the duplicate finder script.
 
@@ -865,14 +686,12 @@ def main(directories, verbose_flag, debug_flag, reset, list_duplicates, generate
     generate_links (bool): Generate link script from detected duplicates.
     reprocess (bool): Reprocess files that are not marked as duplicates.
     manual_verification (bool): Interactively verify possible duplicates.
-    enable_perceptual_hashing (bool): Enable perceptual hashing for images and videos.
     cleanup_flag (bool): Perform cleanup of duplicates after verification.
     """
     global verbose, debug, main_conn, main_cursor, enable_perceptual_hashing
 
     verbose = verbose_flag
     debug = debug_flag
-    enable_perceptual_hashing = enable_perceptual_hashing_flag
 
     try:
         configure_logging()
