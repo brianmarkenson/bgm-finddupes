@@ -2,7 +2,6 @@
 import os
 import time
 import hashlib
-import zlib
 import sqlite3
 import shlex
 from concurrent.futures import ThreadPoolExecutor
@@ -36,7 +35,7 @@ rotating_file_handler.doRollover()
 
 # Constants
 COMMIT_THRESHOLD = 100  # Threshold for database commits
-MIN_FILE_SIZE = 1024  # Minimum file size: 1 KB
+MIN_FILE_SIZE = 4096  # Minimum file size: 1 KB
 
 # Global flags for use in multiple functions without having to pass them around
 verbose = False
@@ -150,21 +149,33 @@ def calculate_md5_middle_dynamic(path, size):
     path (str): Path to the file.
     size (int): Size of the file.
     """
-
     # Calculate subset size as 1% of the file size, with a minimum of 1MB and a maximum of 10MB
     subset_size = min(max(size // 100, 1024 * 1024), 10 * 1024 * 1024)
-    middle_start = (size // 2) - (subset_size // 2)
+
+    # Adjust subset size and middle_start for small files
+    if size < subset_size:
+        subset_size = size
+        middle_start = 0
+    else:
+        middle_start = (size // 2) - (subset_size // 2)
+
     hash_md5 = hashlib.md5()
-    try: 
+
+    try:
         with open(path, "rb") as f:
             f.seek(middle_start)
             chunk = f.read(subset_size)
+            if len(chunk) != subset_size:
+                logger.error(f"Read {len(chunk)} bytes, expected {subset_size} bytes for file: {path}")
+                return None
             hash_md5.update(chunk)
         return hash_md5.hexdigest()
     except FileNotFoundError:
         logger.error(f"File not found: {path}")
     except PermissionError:
         logger.error(f"Permission denied: {path}")
+    except OSError as e:
+        logger.error(f"OS error {e} on file {path}")
     except Exception as e:
         logger.error(f"Error hashing {subset_size} bytes of file {path}: {e}")
     return None
@@ -191,6 +202,11 @@ def scan_directory(directory):
                     log(f"Skipping symbolic link: {path}", 'debug')
                     continue
                 
+                # Skip specific file names
+                if file == '.DS_Store' or file.startswith('._'):
+                    log(f"Skipping excluded file: {path}", 'debug')
+                    continue
+
                 try:
                     # Get file statistics
                     stat = os.stat(path)
@@ -353,9 +369,8 @@ def save_duplicates(duplicates, conn):
     """
     c = conn.cursor()
     try:
-        for duplicate_group in duplicates:
-            md5_hash = duplicate_group[0]  # Assuming the first entry's hash represents the group
-            paths = "|||".join(duplicate_group)
+        for md5_hash, paths in duplicates:
+            paths = "|||".join(paths)
             try:
                 execute_with_retry(c, "INSERT INTO duplicates (md5_hash, paths) VALUES (?, ?)", (md5_hash, paths))
                 log(f"DUPLICATES FOUND: {paths}: {md5_hash}", 'debug')
@@ -373,7 +388,7 @@ def save_duplicates(duplicates, conn):
 def find_duplicates():
     """
     Find duplicate files in the database.
-    
+
     Returns:
     list: List of duplicate file groups.
     """
@@ -384,12 +399,13 @@ def find_duplicates():
         potential_duplicates = c.fetchall()
         total_groups = len(potential_duplicates)  # Determine the total number of groups
         duplicates = []
-        #####################################################################################################################################################################################################
-        ##############################################  Update manual check to first check other portions of the file (last 10MB, first 10MB) before putting into manual verification #######################
-        #####################################################################################################################################################################################################
         manual_check_duplicates = []
-        for group_num, (size, md5_hashes, paths, inodes) in enumerate(potential_duplicates, start=1):
+        for group_num, (size, md5_hashes_str, paths_str, inodes_str) in enumerate(potential_duplicates, start=1):
             log(f"Processing group {group_num}/{total_groups}", 'both')
+            # Split concatenated strings correctly into lists
+            md5_hashes = md5_hashes_str.split('|||')
+            paths = paths_str.split('|||')
+            inodes = inodes_str.split('|||')
             process_duplicate_group(size, md5_hashes, paths, inodes, duplicates, manual_check_duplicates, conn, c)
         save_duplicates(duplicates, conn)
         execute_with_retry(c, "UPDATE files SET processed = 1 WHERE processed = 0")
@@ -449,46 +465,44 @@ def process_duplicate_group(size, md5_hashes, paths, inodes, duplicates, manual_
     conn (sqlite3.Connection): Database connection.
     c (sqlite3.Cursor): Database cursor.
     """
+    # Ensure md5_hashes and paths are lists
+    if isinstance(md5_hashes, str):
+        md5_hashes = md5_hashes.split('|||')
+    if isinstance(paths, str):
+        paths = paths.split('|||')
+
     log(f"Processing group: {paths}, size: {size}, md5 hashes: {md5_hashes}", 'both')
 
     all_files_in_group = set(paths)
     confirmed_duplicates = set()
     files_needing_verification = set()
-    hash_to_files = {}
 
-    # Group files by their hashes
-    for file, md5_hash in zip(paths, md5_hashes):
-        if md5_hash not in hash_to_files:
-            hash_to_files[md5_hash] = []
-        hash_to_files[md5_hash].append(file)
+    # Check if all files have the same hash
+    if len(set(md5_hashes)) == 1:
+        duplicates.append((md5_hashes[0], paths))
+        confirmed_duplicates.update(paths)
+        log(f"Duplicate group confirmed with md5 hash {md5_hashes[0]}: {paths}", 'both')
+        c.executemany("UPDATE files SET processed = 1 WHERE path = ?", [(f,) for f in paths])
+        conn.commit()
+    else:
+        # Determine if manual verification is needed for video files with differing hashes
+        video_files_with_differing_hashes = [f for f in paths if is_video_file(f)]
+        non_video_files_with_differing_hashes = [f for f in paths if not is_video_file(f)]
 
-    # Process files with the same hash
-    for md5_hash, files in hash_to_files.items():
-        if len(files) > 1:
-            duplicates.append(files)
-            confirmed_duplicates.update(files)
-            log(f"Duplicate group confirmed with md5 hash {md5_hash}: {files}", 'both')
-            c.executemany("UPDATE files SET processed = 1 WHERE path = ?", [(f,) for f in files])
+        if video_files_with_differing_hashes:
+            files_needing_verification.update(video_files_with_differing_hashes)
+            # Add one confirmed duplicate for comparison
+            if confirmed_duplicates:
+                reference_file = next(iter(confirmed_duplicates))
+                files_needing_verification.add(reference_file)
+
+        if non_video_files_with_differing_hashes:
+            log(f"Non-video files with differing hashes found, not considering as duplicates: {non_video_files_with_differing_hashes}", 'both')
+            for file in non_video_files_with_differing_hashes:
+                c.execute("UPDATE files SET processed = 1 WHERE path = ?", (file,))
             conn.commit()
 
-    # Process files with differing hashes
-    for md5_hash, files in hash_to_files.items():
-        if len(files) == 1:
-            file = files[0]
-            if is_video_file(file):
-                files_needing_verification.add(file)
-            else:
-                log(f"Non-video file with differing hash found, not considering as duplicate: {file}", 'both')
-                c.execute("UPDATE files SET processed = 1 WHERE path = ?", (file,))
-                conn.commit()
-
-    # Ensure at least one confirmed duplicate is included for manual verification comparison
     if files_needing_verification:
-        # Find a confirmed duplicate to add to the manual verification group
-        if confirmed_duplicates:
-            reference_file = next(iter(confirmed_duplicates))
-            files_needing_verification.add(reference_file)
-
         execute_with_retry(c, "INSERT INTO manual_check_duplicates (paths) VALUES (?)", ("|||".join(files_needing_verification),))
         log(f"Manual check duplicate group: {list(files_needing_verification)}", 'both')
 
@@ -709,11 +723,13 @@ def output_duplicates():
     try:
         global main_conn, main_cursor
         c = main_cursor
-        execute_with_retry(c, "SELECT sha256_hash, paths FROM duplicates")
+        execute_with_retry(c, "SELECT md5_hash, paths FROM duplicates")
         duplicates = c.fetchall()
-        for sha256_hash, paths in duplicates:
-            print(f"SHA-256: {sha256_hash}")
-            print(f"Paths: {paths}")
+        for md5_hash, paths in duplicates:
+            print(f"md5: {md5_hash}")
+            for path in paths.split('|||'):
+              print(f"{path}")
+            #print(f"Paths: {paths}")
             print("="*40)
     except sqlite3.Error as e:
         logger.error(f"Database error while outputting duplicates: {e}")
@@ -765,7 +781,6 @@ def main(directories, verbose_flag, debug_flag, reset, list_duplicates, generate
 
         process_directories(directories)
         duplicates = find_duplicates()
-        save_duplicates(duplicates, main_conn)
         finalize_database()
     except Exception as e:
         logger.error(f"Unhandled exception: {e}")
@@ -789,8 +804,6 @@ def process_directories(directories):
             future.result()
     if debug:
         verify_database()
-    duplicates = find_duplicates()
-    save_duplicates(duplicates, main_conn)
 
 def scan_and_process_directory(directory):
     """
@@ -895,7 +908,6 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true", help="Enable detailed debug output.")
     parser.add_argument("--min-size", type=int, default=MIN_FILE_SIZE, help="Minimum file size for duplicate detection.")
     parser.add_argument("--reset", action="store_true", help="Reset the processed flag for all files.")
-    parser.add_argument("--enable-perceptual-hashing", action="store_true", help="Enable perceptual hashing for images and videos.")
     
     args = parser.parse_args()
 
@@ -908,7 +920,7 @@ if __name__ == "__main__":
     logger.setLevel(logging.DEBUG if args.debug else logging.INFO)
 
     try:
-        main(args.directories, args.verbose, args.debug, args.reset, args.list_duplicates, args.generate_links, args.reprocess, args.manual_verification, args.enable_perceptual_hashing, args.cleanup)
+        main(args.directories, args.verbose, args.debug, args.reset, args.list_duplicates, args.generate_links, args.reprocess, args.manual_verification, args.cleanup)
     except Exception as e:
         logger.error(f"Unhandled exception: {e}")
 
