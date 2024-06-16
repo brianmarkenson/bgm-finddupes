@@ -419,25 +419,6 @@ def find_duplicates():
         logger.error(f"Error in find_duplicates: {e}")
     return duplicates
 
-def output_manual_check_duplicates():
-    """
-    Output the list of possible duplicates for manual verification.
-    """
-    try:
-        conn, c = create_db_connection()
-        execute_with_retry(c, "SELECT group_id, paths FROM manual_check_duplicates")
-        manual_check_duplicates = c.fetchall()
-        for group_id, paths in manual_check_duplicates:
-            print(f"Possible duplicate group {group_id}:\n")
-            for file in paths.split('|||'):
-                print(f"{file}\n")
-            print("="*40 + "\n")
-        conn.close()
-    except sqlite3.Error as e:
-        logger.error(f"Database error during output of possible duplicates: {e}")
-    except Exception as e:
-        logger.error(f"Error outputting possible duplicates: {e}")
-
 def is_video_file(path):
     """
     Check if the given file is a video file based on its MIME type.
@@ -716,7 +697,7 @@ def reprocess_unprocessed_files():
         logger.error(f"Error reprocessing unprocessed files: {e}")
         main_conn.rollback()
 
-def output_duplicates():
+def list_duplicates():
     """
     Output the list of detected duplicates from the database.
     """
@@ -730,13 +711,32 @@ def output_duplicates():
             for path in paths.split('|||'):
               print(f"{path}")
             #print(f"Paths: {paths}")
-            print("="*40)
+            print("="*40 + "\n")
     except sqlite3.Error as e:
         logger.error(f"Database error while outputting duplicates: {e}")
     except Exception as e:
         logger.error(f"Error outputting duplicates: {e}")
 
-def main(directories, verbose_flag, debug_flag, reset, list_duplicates, generate_links, reprocess, manual_verification, cleanup_flag):
+def list_check_duplicates():
+    """
+    Output the list of possible duplicates for manual verification.
+    """
+    try:
+        global main_conn, main_cursor
+        c = main_cursor
+        execute_with_retry(c, "SELECT group_id, paths FROM manual_check_duplicates")
+        manual_check_duplicates = c.fetchall()
+        for group_id, paths in manual_check_duplicates:
+            print(f"Possible duplicate group {group_id}:\n")
+            for file in paths.split('|||'):
+                print(f"{file}")
+            print("="*40 + "\n")
+    except sqlite3.Error as e:
+        logger.error(f"Database error during output of possible duplicates: {e}")
+    except Exception as e:
+        logger.error(f"Error outputting possible duplicates: {e}")
+
+def main(directories, verbose_flag, debug_flag, reset_flag, list_duplicates_flag, list_check_duplicates_flag, generate_links_flag, reprocess_flag, manual_verification_flag, cleanup_flag):
     """
     Main function to execute the duplicate finder script.
 
@@ -744,11 +744,12 @@ def main(directories, verbose_flag, debug_flag, reset, list_duplicates, generate
     directories (list): List of directories to scan.
     verbose_flag (bool): Enable verbose logging.
     debug_flag (bool): Enable detailed debug logging.
-    reset (bool): Reset the processed flag for all files.
-    list_duplicates (bool): Output list of detected duplicates.
-    generate_links (bool): Generate link script from detected duplicates.
-    reprocess (bool): Reprocess files that are not marked as duplicates.
-    manual_verification (bool): Interactively verify possible duplicates.
+    reset_flag (bool): Reset the processed flag for all files.
+    list_duplicates_flag (bool): Output list of detected duplicates.
+    list_check_duplicates_flag (bool): Output list of duplicates that require manual checking.
+    generate_links_flag (bool): Generate link script from detected duplicates.
+    reprocess_flag (bool): Reprocess files that are not marked as duplicates.
+    manual_verification_flag (bool): Interactively verify possible duplicates.
     cleanup_flag (bool): Perform cleanup of duplicates after verification.
     """
     global verbose, debug, main_conn, main_cursor, enable_perceptual_hashing
@@ -760,19 +761,22 @@ def main(directories, verbose_flag, debug_flag, reset, list_duplicates, generate
         configure_logging()
         init_db()
 
-        if reset:
+        if reset_flag:
             reset_processed()
 
-        if list_duplicates:
-            output_duplicates()
+        if list_duplicates_flag:
+            list_duplicates()
             return
-        if generate_links:
+        if list_check_duplicates_flag:
+            list_check_duplicates()
+            return
+        if generate_links_flag:
             generate_link_script()
             return
-        if reprocess:
+        if reprocess_flag:
             reprocess_unprocessed_files()
             return
-        if manual_verification:
+        if manual_verification_flag:
             verify_manual_check_duplicates()
             return
         if cleanup_flag:
@@ -898,6 +902,7 @@ if __name__ == "__main__":
     # Define mutually exclusive group
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--list-duplicates", action="store_true", help="Output list of detected duplicates.")
+    group.add_argument("--list-check-duplicates", action="store_true", help="Output list of possible duplicates that require manual checking.")
     group.add_argument("--generate-links", action="store_true", help="Generate link script from detected duplicates.")
     group.add_argument("--reprocess", action="store_true", help="Reprocess files that are not marked as duplicates.")
     group.add_argument("--manual-verification", action="store_true", help="Interactively verify possible duplicates.")
@@ -908,11 +913,11 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true", help="Enable detailed debug output.")
     parser.add_argument("--min-size", type=int, default=MIN_FILE_SIZE, help="Minimum file size for duplicate detection.")
     parser.add_argument("--reset", action="store_true", help="Reset the processed flag for all files.")
-    
+
     args = parser.parse_args()
 
-    if not (args.list_duplicates or args.generate_links or args.reprocess or args.manual_verification or args.cleanup or args.reset) and not args.directories:
-        parser.error("directories argument is required unless one of --list-duplicates, --generate-links, --reprocess, --manual-verification, --cleanup, or --reset is specified")
+    if not (args.list_duplicates or args.list_check_duplicates or args.generate_links or args.reprocess or args.manual_verification or args.cleanup or args.reset) and not args.directories:
+        parser.error("directories argument is required unless one of --list-duplicates, --list-check-duplicates, --generate-links, --reprocess, --manual-verification, --cleanup, or --reset is specified")
 
     # Use the provided min size or default to MIN_FILE_SIZE
     MIN_FILE_SIZE = args.min_size
@@ -920,7 +925,7 @@ if __name__ == "__main__":
     logger.setLevel(logging.DEBUG if args.debug else logging.INFO)
 
     try:
-        main(args.directories, args.verbose, args.debug, args.reset, args.list_duplicates, args.generate_links, args.reprocess, args.manual_verification, args.cleanup)
+        main(args.directories, args.verbose, args.debug, args.reset, args.list_duplicates, args.list_check_duplicates, args.generate_links, args.reprocess, args.manual_verification, args.cleanup)
     except Exception as e:
         logger.error(f"Unhandled exception: {e}")
 
